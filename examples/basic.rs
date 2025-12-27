@@ -5,6 +5,7 @@
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
 use plumesplat::prelude::*;
 
@@ -47,12 +48,19 @@ fn setup(
         converted: false,
     });
 
-    // Create material with the texture array
-    let material = PlumeSplatMaterial::new()
-        .with_albedo(albedo_handle)
-        .with_uv_scale(0.5)
-        .with_triplanar_sharpness(4.0)
-        .with_roughness(0.8);
+    // Create ExtendedMaterial with StandardMaterial base + PlumeSplatExtension
+    let material = PlumeSplatMaterial {
+        base: StandardMaterial {
+            // Base material settings (used for lighting parameters)
+            perceptual_roughness: 0.8,
+            metallic: 0.0,
+            reflectance: 0.3,
+            ..default()
+        },
+        extension: PlumeSplatExtension::new(albedo_handle)
+            .with_uv_scale(0.5)
+            .with_triplanar_sharpness(2.0),
+    };
 
     let material_handle = materials.add(material);
 
@@ -64,15 +72,22 @@ fn setup(
         TerrainMarker,
     ));
 
-    // Spawn light
+    // Spawn directional light (sun)
     commands.spawn((
         DirectionalLight {
-            illuminance: 10000.0,
+            illuminance: 15000.0,
             shadows_enabled: true,
             ..default()
         },
-        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.8, 0.5, 0.0)),
+        Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.4, 0.0)),
     ));
+
+    // Ambient light
+    commands.insert_resource(AmbientLight {
+        color: Color::WHITE,
+        brightness: 200.0,
+        ..default()
+    });
 
     // Spawn camera
     commands.spawn((
@@ -84,6 +99,7 @@ fn setup(
     info!("PlumeSplat basic example running!");
     info!("Terrain uses 4 materials: grass, dirt, rock, snow");
     info!("Materials blend based on height and slope.");
+    info!("Now using ExtendedMaterial for proper PBR lighting!");
 }
 
 /// Convert the loaded stacked 2D texture into a 2D array texture

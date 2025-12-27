@@ -8,7 +8,7 @@
 //! - **Per-Vertex Material Assignment**: Store up to 4 material indices per vertex
 //! - **Triplanar Mapping**: UV-less texturing for arbitrary geometry
 //! - **Height-Based Blending**: Optional height-map based transitions between materials
-//! - **PBR Support**: Full physically-based rendering with albedo, normal, roughness, metallic, and AO
+//! - **Full PBR Support**: Extends StandardMaterial for proper lighting integration
 //!
 //! ## Usage
 //!
@@ -29,7 +29,7 @@ mod plugin;
 mod vertex_attributes;
 
 pub mod prelude {
-    pub use crate::material::PlumeSplatMaterial;
+    pub use crate::material::{PlumeSplatExtension, PlumeSplatMaterial, PlumeSplatSettings};
     pub use crate::plugin::PlumeSplatPlugin;
     pub use crate::vertex_attributes::{
         ATTRIBUTE_MATERIAL_INDICES, ATTRIBUTE_MATERIAL_WEIGHTS, MaterialVertex,

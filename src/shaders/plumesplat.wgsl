@@ -72,6 +72,7 @@ fn triplanar_weights(world_normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
 }
 
 // Sample texture array using triplanar projection
+// Properly handles UV direction based on normal sign to avoid stretching
 fn sample_triplanar_albedo(
     world_pos: vec3<f32>,
     world_normal: vec3<f32>,
@@ -82,9 +83,19 @@ fn sample_triplanar_albedo(
     let weights = triplanar_weights(world_normal, sharpness);
     let scaled_pos = world_pos * uv_scale;
 
-    let sample_x = textureSample(albedo_array, albedo_sampler, scaled_pos.zy, layer);
-    let sample_y = textureSample(albedo_array, albedo_sampler, scaled_pos.xz, layer);
-    let sample_z = textureSample(albedo_array, albedo_sampler, scaled_pos.xy, layer);
+    // Flip UVs based on normal direction to prevent mirroring/stretching
+    let flip = sign(world_normal);
+
+    // X-axis projection (YZ plane) - flip Z based on normal.x direction
+    let uv_x = vec2<f32>(scaled_pos.z * flip.x, scaled_pos.y);
+    // Y-axis projection (XZ plane) - flip X based on normal.y direction
+    let uv_y = vec2<f32>(scaled_pos.x * flip.y, scaled_pos.z);
+    // Z-axis projection (XY plane) - flip X based on normal.z direction
+    let uv_z = vec2<f32>(scaled_pos.x * -flip.z, scaled_pos.y);
+
+    let sample_x = textureSample(albedo_array, albedo_sampler, uv_x, layer);
+    let sample_y = textureSample(albedo_array, albedo_sampler, uv_y, layer);
+    let sample_z = textureSample(albedo_array, albedo_sampler, uv_z, layer);
 
     return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
 }
@@ -100,16 +111,21 @@ fn sample_triplanar_normal(
     let weights = triplanar_weights(world_normal, sharpness);
     let scaled_pos = world_pos * uv_scale;
 
-    // Sample normal maps
-    let raw_x = textureSample(normal_array, normal_sampler, scaled_pos.zy, layer).xyz * 2.0 - 1.0;
-    let raw_y = textureSample(normal_array, normal_sampler, scaled_pos.xz, layer).xyz * 2.0 - 1.0;
-    let raw_z = textureSample(normal_array, normal_sampler, scaled_pos.xy, layer).xyz * 2.0 - 1.0;
+    // Flip UVs based on normal direction
+    let flip = sign(world_normal);
+    let uv_x = vec2<f32>(scaled_pos.z * flip.x, scaled_pos.y);
+    let uv_y = vec2<f32>(scaled_pos.x * flip.y, scaled_pos.z);
+    let uv_z = vec2<f32>(scaled_pos.x * -flip.z, scaled_pos.y);
 
-    // Convert to world space for each projection
-    let sign_n = sign(world_normal);
-    let normal_x = vec3<f32>(raw_x.z * sign_n.x, raw_x.y, raw_x.x);
-    let normal_y = vec3<f32>(raw_y.x, raw_y.z * sign_n.y, raw_y.y);
-    let normal_z = vec3<f32>(raw_z.x, raw_z.y, raw_z.z * sign_n.z);
+    // Sample normal maps
+    let raw_x = textureSample(normal_array, normal_sampler, uv_x, layer).xyz * 2.0 - 1.0;
+    let raw_y = textureSample(normal_array, normal_sampler, uv_y, layer).xyz * 2.0 - 1.0;
+    let raw_z = textureSample(normal_array, normal_sampler, uv_z, layer).xyz * 2.0 - 1.0;
+
+    // Convert to world space for each projection (UDN blending)
+    let normal_x = vec3<f32>(0.0, raw_x.y, raw_x.x * flip.x) + vec3<f32>(flip.x, 0.0, 0.0);
+    let normal_y = vec3<f32>(raw_y.x, 0.0, raw_y.y * flip.y) + vec3<f32>(0.0, flip.y, 0.0);
+    let normal_z = vec3<f32>(raw_z.x * -flip.z, raw_z.y, 0.0) + vec3<f32>(0.0, 0.0, flip.z);
 
     return normalize(normal_x * weights.x + normal_y * weights.y + normal_z * weights.z);
 }
@@ -125,9 +141,15 @@ fn sample_triplanar_arm(
     let weights = triplanar_weights(world_normal, sharpness);
     let scaled_pos = world_pos * uv_scale;
 
-    let sample_x = textureSample(arm_array, arm_sampler, scaled_pos.zy, layer).rgb;
-    let sample_y = textureSample(arm_array, arm_sampler, scaled_pos.xz, layer).rgb;
-    let sample_z = textureSample(arm_array, arm_sampler, scaled_pos.xy, layer).rgb;
+    // Flip UVs based on normal direction
+    let flip = sign(world_normal);
+    let uv_x = vec2<f32>(scaled_pos.z * flip.x, scaled_pos.y);
+    let uv_y = vec2<f32>(scaled_pos.x * flip.y, scaled_pos.z);
+    let uv_z = vec2<f32>(scaled_pos.x * -flip.z, scaled_pos.y);
+
+    let sample_x = textureSample(arm_array, arm_sampler, uv_x, layer).rgb;
+    let sample_y = textureSample(arm_array, arm_sampler, uv_y, layer).rgb;
+    let sample_z = textureSample(arm_array, arm_sampler, uv_z, layer).rgb;
 
     return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
 }

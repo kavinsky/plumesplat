@@ -25,10 +25,11 @@ impl Plugin for PlumeSplatPlugin {
     fn build(&self, app: &mut App) {
         // Embed the shader files into the binary
         embedded_asset!(app, "shaders/plumesplat.wgsl");
+        embedded_asset!(app, "shaders/plumesplat_ext.wgsl");
         embedded_asset!(app, "shaders/triplanar.wgsl");
         embedded_asset!(app, "shaders/blending.wgsl");
 
-        // Register the custom material
+        // Register the extended material (StandardMaterial + PlumeSplatExtension)
         app.add_plugins(MaterialPlugin::<PlumeSplatMaterial>::default());
     }
 }
