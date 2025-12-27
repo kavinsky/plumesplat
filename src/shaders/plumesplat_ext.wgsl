@@ -53,14 +53,18 @@ fn unpack_u8x4(packed: u32) -> vec4<u32> {
 }
 
 // Compute triplanar blend weights from world normal
+// Uses squared weights for sharper transitions on steep slopes
 fn triplanar_weights(world_normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
     var weights = abs(world_normal);
+    // Apply sharpness - higher values give sharper transitions
     weights = pow(weights, vec3<f32>(sharpness));
+    // Normalize
     let sum = weights.x + weights.y + weights.z;
-    return weights / max(sum, 0.001);
+    return weights / max(sum, 0.0001);
 }
 
 // Sample texture array using triplanar projection
+// Properly handles axis flipping to prevent texture mirroring/stretching
 fn sample_triplanar(
     world_pos: vec3<f32>,
     world_normal: vec3<f32>,
@@ -71,13 +75,24 @@ fn sample_triplanar(
     let weights = triplanar_weights(world_normal, sharpness);
     let scaled_pos = world_pos * uv_scale;
 
-    // Proper triplanar UV projection
-    // Y-axis projection (top-down, XZ plane) - most common for terrain
-    let uv_y = scaled_pos.xz;
-    // X-axis projection (side, YZ plane)
-    let uv_x = scaled_pos.zy;
-    // Z-axis projection (front, XY plane)
-    let uv_z = scaled_pos.xy;
+    // Compute UVs with proper axis orientation to prevent mirroring
+    // X-axis projection (YZ plane) - flip based on normal direction
+    var uv_x = scaled_pos.zy;
+    if world_normal.x < 0.0 {
+        uv_x.x = -uv_x.x;
+    }
+
+    // Y-axis projection (XZ plane) - most common for terrain tops
+    var uv_y = scaled_pos.xz;
+    if world_normal.y < 0.0 {
+        uv_y.y = -uv_y.y;
+    }
+
+    // Z-axis projection (XY plane) - flip based on normal direction
+    var uv_z = scaled_pos.xy;
+    if world_normal.z < 0.0 {
+        uv_z.x = -uv_z.x;
+    }
 
     let sample_x = textureSample(albedo_array, albedo_array_sampler, uv_x, layer);
     let sample_y = textureSample(albedo_array, albedo_array_sampler, uv_y, layer);

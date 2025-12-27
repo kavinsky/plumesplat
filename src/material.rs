@@ -66,7 +66,7 @@ impl Default for PlumeSplatExtension {
             albedo_array: Handle::default(),
             settings: PlumeSplatSettings {
                 uv_scale: 1.0,
-                triplanar_sharpness: 2.0,
+                triplanar_sharpness: 4.0, // Higher for sharper transitions on steep slopes
                 height_blend_sharpness: 0.0,
             },
         }
