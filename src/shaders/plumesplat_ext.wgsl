@@ -20,6 +20,10 @@ struct PlumeSplatSettings {
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> settings: PlumeSplatSettings;
 
+// Normal map array (optional - bound when available)
+@group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(104) var normal_array_sampler: sampler;
+
 // Extended vertex output with our custom material data
 struct PlumeSplatVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -197,6 +201,105 @@ fn height_blend(heights: vec4<f32>, weights: vec4<f32>, sharpness: f32) -> vec4<
     return weights;
 }
 
+// Sample normal map with stochastic tiling (similar to albedo sampling)
+fn sample_normal_stochastic(
+    uv: vec2<f32>,
+    layer: i32,
+    ddx_uv: vec2<f32>,
+    ddy_uv: vec2<f32>
+) -> vec3<f32> {
+    // Get integer tile coordinate
+    let tile = floor(uv);
+    let f = fract(uv);
+    
+    var normal = vec3<f32>(0.0);
+    var total_weight = 0.0;
+    
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let offset = vec2<f32>(f32(i), f32(j));
+            let tile_pos = tile + offset;
+            let rand = hash2(tile_pos);
+            let offset_uv = uv + rand;
+            
+            let dist = f - offset + 0.5;
+            let weight = max(0.0, 1.0 - dot(dist, dist) * 2.0);
+            
+            if weight > 0.001 {
+                // Sample normal map and decode from [0,1] to [-1,1]
+                let sampled = textureSampleGrad(normal_array, normal_array_sampler, offset_uv, layer, ddx_uv, ddy_uv).rgb;
+                let decoded = sampled * 2.0 - 1.0;
+                normal += decoded * weight;
+                total_weight += weight;
+            }
+        }
+    }
+    
+    return normalize(normal / max(total_weight, 0.001));
+}
+
+// Sample normal map at single scale with triplanar projection
+fn sample_normal_triplanar_single_scale(
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+    layer: i32,
+    uv_scale: f32,
+    sharpness: f32
+) -> vec3<f32> {
+    let weights = triplanar_weights(world_normal, sharpness);
+    let scaled_pos = world_pos * uv_scale;
+
+    let uv_x = scaled_pos.yz;
+    let uv_y = scaled_pos.xz;
+    let uv_z = scaled_pos.xy;
+
+    let dpdx_pos = dpdx(scaled_pos);
+    let dpdy_pos = dpdy(scaled_pos);
+    
+    let ddx_x = dpdx_pos.yz;
+    let ddy_x = dpdy_pos.yz;
+    let ddx_y = dpdx_pos.xz;
+    let ddy_y = dpdy_pos.xz;
+    let ddx_z = dpdx_pos.xy;
+    let ddy_z = dpdy_pos.xy;
+
+    // Sample normals for each projection
+    let normal_x = sample_normal_stochastic(uv_x, layer, ddx_x, ddy_x);
+    let normal_y = sample_normal_stochastic(uv_y, layer, ddx_y, ddy_y);
+    let normal_z = sample_normal_stochastic(uv_z, layer, ddx_z, ddy_z);
+
+    // Swizzle normals to world space orientation for each projection
+    // X projection (YZ plane): normal is in YZ tangent space
+    let world_normal_x = vec3<f32>(normal_x.z, normal_x.x, normal_x.y);
+    // Y projection (XZ plane): normal is in XZ tangent space  
+    let world_normal_y = vec3<f32>(normal_y.x, normal_y.z, normal_y.y);
+    // Z projection (XY plane): normal is in XY tangent space
+    let world_normal_z = vec3<f32>(normal_z.x, normal_z.y, normal_z.z);
+
+    // Blend normals based on triplanar weights
+    let blended = world_normal_x * weights.x + world_normal_y * weights.y + world_normal_z * weights.z;
+    return normalize(blended);
+}
+
+// Sample normal map with triplanar projection (single scale for normals - multi-scale causes artifacts)
+fn sample_normal_triplanar(
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+    layer: i32,
+    uv_scale: f32,
+    sharpness: f32
+) -> vec3<f32> {
+    // Use single scale for normals to avoid blending artifacts
+    return sample_normal_triplanar_single_scale(world_pos, world_normal, layer, uv_scale, sharpness);
+}
+
+// Reoriented Normal Mapping (RNM) blend - better than linear blending for normals
+fn blend_rnm(n1: vec3<f32>, n2: vec3<f32>) -> vec3<f32> {
+    let t = n1 + vec3<f32>(0.0, 0.0, 1.0);
+    let u = n2 * vec3<f32>(-1.0, -1.0, 1.0);
+    return normalize(t * dot(t, u) - u * t.z);
+}
+
 @vertex
 fn vertex(
     @builtin(instance_index) instance_index: u32,
@@ -231,11 +334,11 @@ fn fragment(
 ) -> FragmentOutput {
     // Get world position and normal for triplanar
     let world_pos = in.world_position.xyz;
-    var world_normal = normalize(in.world_normal);
+    var geometry_normal = normalize(in.world_normal);
 
     // Handle back faces
     if !is_front {
-        world_normal = -world_normal;
+        geometry_normal = -geometry_normal;
     }
 
     // Unpack material indices (flat interpolated - same for whole triangle)
@@ -258,11 +361,11 @@ fn fragment(
     let uv_scale = settings.uv_scale;
     let sharpness = settings.triplanar_sharpness;
     
-    // Sample each material layer
-    let albedo0 = sample_triplanar(world_pos, world_normal, idx0, uv_scale, sharpness);
-    let albedo1 = sample_triplanar(world_pos, world_normal, idx1, uv_scale, sharpness);
-    let albedo2 = sample_triplanar(world_pos, world_normal, idx2, uv_scale, sharpness);
-    let albedo3 = sample_triplanar(world_pos, world_normal, idx3, uv_scale, sharpness);
+    // Sample each material layer (albedo)
+    let albedo0 = sample_triplanar(world_pos, geometry_normal, idx0, uv_scale, sharpness);
+    let albedo1 = sample_triplanar(world_pos, geometry_normal, idx1, uv_scale, sharpness);
+    let albedo2 = sample_triplanar(world_pos, geometry_normal, idx2, uv_scale, sharpness);
+    let albedo3 = sample_triplanar(world_pos, geometry_normal, idx3, uv_scale, sharpness);
 
     // Optional height-based blending
     if settings.height_blend_sharpness > 0.0 {
@@ -274,9 +377,25 @@ fn fragment(
     let final_albedo = albedo0 * weights.x + albedo1 * weights.y +
                        albedo2 * weights.z + albedo3 * weights.w;
     
-    // Simple lighting
+    // Sample and blend normal maps
+    // Use geometry normal for triplanar projection, then perturb it with sampled normals
+    let normal0 = sample_normal_triplanar(world_pos, geometry_normal, idx0, uv_scale, sharpness);
+    let normal1 = sample_normal_triplanar(world_pos, geometry_normal, idx1, uv_scale, sharpness);
+    let normal2 = sample_normal_triplanar(world_pos, geometry_normal, idx2, uv_scale, sharpness);
+    let normal3 = sample_normal_triplanar(world_pos, geometry_normal, idx3, uv_scale, sharpness);
+    
+    // Blend normals (linear blend then normalize - simple but effective)
+    var blended_normal = normal0 * weights.x + normal1 * weights.y +
+                         normal2 * weights.z + normal3 * weights.w;
+    blended_normal = normalize(blended_normal);
+    
+    // Combine sampled normal with geometry normal using RNM blending
+    // This perturbs the geometry normal by the detail from the normal map
+    let final_normal = blend_rnm(geometry_normal, blended_normal);
+    
+    // Simple lighting with normal mapped surface
     let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.4));
-    let ndotl = max(dot(world_normal, light_dir), 0.0);
+    let ndotl = max(dot(final_normal, light_dir), 0.0);
     let ambient = 0.3;
     let diffuse = ndotl * 0.7;
     let lit_color = (ambient + diffuse) * final_albedo.rgb;
@@ -284,28 +403,4 @@ fn fragment(
     var out: FragmentOutput;
     out.color = vec4<f32>(lit_color, 1.0);
     return out;
-
-    // FULL PBR (uncomment when textures are verified working):
-    // // Construct VertexOutput for PBR functions
-    // var vertex_out: VertexOutput;
-    // vertex_out.position = in.position;
-    // vertex_out.world_position = in.world_position;
-    // vertex_out.world_normal = in.world_normal;
-    // vertex_out.uv = in.uv;
-    //
-    // // Generate PBR input from standard material
-    // var pbr_input = pbr_input_from_standard_material(vertex_out, is_front);
-    //
-    // // Override the base color with our splatted texture
-    // pbr_input.material.base_color = final_albedo;
-    //
-    // // Apply alpha discard if needed
-    // pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
-    //
-    // // Apply full PBR lighting
-    // var out: FragmentOutput;
-    // out.color = apply_pbr_lighting(pbr_input);
-    // out.color = main_pass_post_lighting_processing(pbr_input, out.color);
-    //
-    // return out;
 }

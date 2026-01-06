@@ -31,6 +31,7 @@ pub type PlumeSplatMaterial = ExtendedMaterial<StandardMaterial, PlumeSplatExten
 ///
 /// The extension expects texture arrays where each layer represents a different material:
 /// - `albedo_array`: Base color textures (RGBA)
+/// - `normal_array`: Normal map textures (RGB, optional)
 ///
 /// ## Vertex Attributes
 ///
@@ -43,6 +44,12 @@ pub struct PlumeSplatExtension {
     #[texture(100, dimension = "2d_array")]
     #[sampler(101, sampler_type = "filtering")]
     pub albedo_array: Handle<Image>,
+
+    /// Normal map texture array. Each layer corresponds to the same material index as albedo.
+    /// Optional - if not provided, geometry normals will be used.
+    #[texture(103, dimension = "2d_array")]
+    #[sampler(104, sampler_type = "filtering")]
+    pub normal_array: Option<Handle<Image>>,
 
     /// Material configuration uniforms.
     #[uniform(102)]
@@ -64,6 +71,7 @@ impl Default for PlumeSplatExtension {
     fn default() -> Self {
         Self {
             albedo_array: Handle::default(),
+            normal_array: None,
             settings: PlumeSplatSettings {
                 uv_scale: 1.0,
                 triplanar_sharpness: 4.0, // Higher for sharper transitions on steep slopes
@@ -97,6 +105,12 @@ impl PlumeSplatExtension {
     /// Enable height-based blending with specified sharpness.
     pub fn with_height_blending(mut self, sharpness: f32) -> Self {
         self.settings.height_blend_sharpness = sharpness;
+        self
+    }
+
+    /// Set the normal map texture array.
+    pub fn with_normal_array(mut self, normal_array: Handle<Image>) -> Self {
+        self.normal_array = Some(normal_array);
         self
     }
 }

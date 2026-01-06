@@ -80,11 +80,13 @@ fn auto_screenshot(
 #[derive(Component)]
 struct TerrainMarker;
 
-/// Resource to track the texture array handle
+/// Resource to track the texture array handles
 #[derive(Resource)]
-struct TextureArrayHandle {
-    handle: Handle<Image>,
-    converted: bool,
+struct TextureArrayHandles {
+    albedo_handle: Handle<Image>,
+    normal_handle: Option<Handle<Image>>,
+    albedo_converted: bool,
+    normal_converted: bool,
 }
 
 fn setup(
@@ -97,13 +99,18 @@ fn setup(
     let terrain_mesh = create_terrain_mesh(128, 128, 10.0, 2.0);
     let mesh_handle = meshes.add(terrain_mesh);
 
-    // Load the stacked texture (4 layers stacked vertically: grass, dirt, rock, snow)
+    // Load the stacked textures (4 layers stacked vertically: grass, dirt, rock, snow)
     let albedo_handle: Handle<Image> = asset_server.load("textures/terrain_albedo_array.png");
 
-    // Store handle for conversion
-    commands.insert_resource(TextureArrayHandle {
-        handle: albedo_handle.clone(),
-        converted: false,
+    // Load normal maps (optional - comment out if not available)
+    let normal_handle: Handle<Image> = asset_server.load("textures/terrain_normal_array.png");
+
+    // Store handles for conversion
+    commands.insert_resource(TextureArrayHandles {
+        albedo_handle: albedo_handle.clone(),
+        normal_handle: Some(normal_handle.clone()),
+        albedo_converted: false,
+        normal_converted: false,
     });
 
     // Create ExtendedMaterial with StandardMaterial base + PlumeSplatExtension
@@ -116,6 +123,7 @@ fn setup(
             ..default()
         },
         extension: PlumeSplatExtension::new(albedo_handle)
+            .with_normal_array(normal_handle)
             .with_uv_scale(2.0) // Texture tiling scale
             .with_triplanar_sharpness(4.0), // Moderate triplanar sharpness
     };
@@ -161,66 +169,77 @@ fn setup(
     info!("Now using ExtendedMaterial for proper PBR lighting!");
 }
 
-/// Convert the loaded stacked 2D texture into a 2D array texture with mipmaps
+/// Convert a stacked 2D texture into a 2D array texture with mipmaps
+fn convert_stacked_to_array(image: &mut Image, num_layers: u32, name: &str) {
+    // Get source dimensions (stacked vertically)
+    let src_width = image.texture_descriptor.size.width;
+    let src_height = image.texture_descriptor.size.height;
+    let layer_height = src_height / num_layers;
+
+    // Calculate number of mip levels
+    let mip_count = (layer_height.min(src_width) as f32).log2().floor() as u32 + 1;
+
+    info!(
+        "Generating {} mip levels for {}x{} {} array with {} layers",
+        mip_count, src_width, layer_height, name, num_layers
+    );
+
+    // Get source data
+    let src_data = image.data.as_ref().expect("Image should have data");
+
+    // Generate mipmapped texture array
+    let mipmapped_data =
+        generate_mipmaps_for_array(src_data, src_width, layer_height, num_layers, mip_count);
+
+    // Update image with mipmapped data
+    image.data = Some(mipmapped_data);
+    image.texture_descriptor.size = Extent3d {
+        width: src_width,
+        height: layer_height,
+        depth_or_array_layers: num_layers,
+    };
+    image.texture_descriptor.dimension = TextureDimension::D2;
+    image.texture_descriptor.mip_level_count = mip_count;
+
+    // Configure sampler with anisotropic filtering for quality
+    image.sampler = bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
+        address_mode_u: bevy::image::ImageAddressMode::Repeat,
+        address_mode_v: bevy::image::ImageAddressMode::Repeat,
+        address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
+        mag_filter: bevy::image::ImageFilterMode::Linear,
+        min_filter: bevy::image::ImageFilterMode::Linear,
+        mipmap_filter: bevy::image::ImageFilterMode::Linear,
+        anisotropy_clamp: 16,
+        ..default()
+    });
+}
+
+/// Convert the loaded stacked 2D textures into 2D array textures with mipmaps
 fn convert_texture_to_array(
-    mut texture_handle: ResMut<TextureArrayHandle>,
+    mut texture_handles: ResMut<TextureArrayHandles>,
     mut images: ResMut<Assets<Image>>,
 ) {
-    if texture_handle.converted {
-        return;
+    const NUM_LAYERS: u32 = 4;
+
+    // Convert albedo texture
+    if !texture_handles.albedo_converted {
+        if let Some(image) = images.get_mut(&texture_handles.albedo_handle) {
+            convert_stacked_to_array(image, NUM_LAYERS, "albedo");
+            texture_handles.albedo_converted = true;
+        }
     }
 
-    if let Some(image) = images.get_mut(&texture_handle.handle) {
-        const NUM_LAYERS: u32 = 4;
-
-        // Get source dimensions (stacked vertically)
-        let src_width = image.texture_descriptor.size.width;
-        let src_height = image.texture_descriptor.size.height;
-        let layer_height = src_height / NUM_LAYERS;
-
-        // Calculate number of mip levels
-        let mip_count = (layer_height.min(src_width) as f32).log2().floor() as u32 + 1;
-
-        info!(
-            "Generating {} mip levels for {}x{} texture array with {} layers",
-            mip_count, src_width, layer_height, NUM_LAYERS
-        );
-
-        // Get source data
-        let src_data = image.data.as_ref().expect("Image should have data");
-
-        // Generate mipmapped texture array
-        let mipmapped_data =
-            generate_mipmaps_for_array(src_data, src_width, layer_height, NUM_LAYERS, mip_count);
-
-        // Update image with mipmapped data
-        image.data = Some(mipmapped_data);
-        image.texture_descriptor.size = Extent3d {
-            width: src_width,
-            height: layer_height,
-            depth_or_array_layers: NUM_LAYERS,
-        };
-        image.texture_descriptor.dimension = TextureDimension::D2;
-        image.texture_descriptor.mip_level_count = mip_count;
-
-        // Configure sampler with anisotropic filtering for quality
-        image.sampler =
-            bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
-                address_mode_u: bevy::image::ImageAddressMode::Repeat,
-                address_mode_v: bevy::image::ImageAddressMode::Repeat,
-                address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
-                mag_filter: bevy::image::ImageFilterMode::Linear,
-                min_filter: bevy::image::ImageFilterMode::Linear,
-                mipmap_filter: bevy::image::ImageFilterMode::Linear,
-                anisotropy_clamp: 16,
-                ..default()
-            });
-
-        info!(
-            "Converted texture to 2D array with {} layers and {} mip levels",
-            NUM_LAYERS, mip_count
-        );
-        texture_handle.converted = true;
+    // Convert normal texture (if provided)
+    if !texture_handles.normal_converted {
+        if let Some(ref normal_handle) = texture_handles.normal_handle {
+            if let Some(image) = images.get_mut(normal_handle) {
+                convert_stacked_to_array(image, NUM_LAYERS, "normal");
+                texture_handles.normal_converted = true;
+            }
+        } else {
+            // No normal map provided, mark as done
+            texture_handles.normal_converted = true;
+        }
     }
 }
 
