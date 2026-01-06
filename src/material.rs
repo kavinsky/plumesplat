@@ -41,7 +41,7 @@ pub type PlumeSplatMaterial = ExtendedMaterial<StandardMaterial, PlumeSplatExten
 pub struct PlumeSplatExtension {
     /// Albedo/base color texture array. Each layer is a different material.
     #[texture(100, dimension = "2d_array")]
-    #[sampler(101)]
+    #[sampler(101, sampler_type = "filtering")]
     pub albedo_array: Handle<Image>,
 
     /// Material configuration uniforms.

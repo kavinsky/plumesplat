@@ -7,6 +7,8 @@ use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension};
+use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use plumesplat::prelude::*;
 
 fn main() {
@@ -14,8 +16,64 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(PlumeSplatPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (convert_texture_to_array, rotate_camera))
+        .add_systems(
+            Update,
+            (convert_texture_to_array, rotate_camera, auto_screenshot),
+        )
         .run();
+}
+
+/// Resource to track screenshot timing
+#[derive(Resource)]
+struct ScreenshotTimer {
+    timer: Timer,
+    taken: bool,
+    frames_after_screenshot: u32,
+}
+
+impl Default for ScreenshotTimer {
+    fn default() -> Self {
+        Self {
+            timer: Timer::from_seconds(3.0, TimerMode::Once),
+            taken: false,
+            frames_after_screenshot: 0,
+        }
+    }
+}
+
+/// Automatically take a screenshot after a delay and exit
+fn auto_screenshot(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut screenshot_timer: Option<ResMut<ScreenshotTimer>>,
+) {
+    // Initialize the timer resource if it doesn't exist
+    if screenshot_timer.is_none() {
+        commands.insert_resource(ScreenshotTimer::default());
+        return;
+    }
+
+    let timer = screenshot_timer.as_mut().unwrap();
+    timer.timer.tick(time.delta());
+
+    if timer.timer.is_finished() && !timer.taken {
+        timer.taken = true;
+        let path = "./screenshot.png";
+        info!("Taking screenshot: {}", path);
+        commands
+            .spawn(Screenshot::primary_window())
+            .observe(save_to_disk(path.to_string()));
+    }
+
+    // Count frames after screenshot and exit after enough time for save
+    if timer.taken {
+        timer.frames_after_screenshot += 1;
+        // Wait ~30 frames (~0.5s at 60fps) to ensure screenshot is saved
+        if timer.frames_after_screenshot > 30 {
+            info!("Screenshot saved, exiting...");
+            std::process::exit(0);
+        }
+    }
 }
 
 /// Marker for the terrain entity so we can update its material
@@ -35,8 +93,8 @@ fn setup(
     mut materials: ResMut<Assets<PlumeSplatMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    // Create a terrain-like mesh
-    let terrain_mesh = create_terrain_mesh(64, 64, 10.0, 2.0);
+    // Create a terrain-like mesh (higher resolution for smoother blending)
+    let terrain_mesh = create_terrain_mesh(128, 128, 10.0, 2.0);
     let mesh_handle = meshes.add(terrain_mesh);
 
     // Load the stacked texture (4 layers stacked vertically: grass, dirt, rock, snow)
@@ -58,8 +116,8 @@ fn setup(
             ..default()
         },
         extension: PlumeSplatExtension::new(albedo_handle)
-            .with_uv_scale(0.5)
-            .with_triplanar_sharpness(2.0),
+            .with_uv_scale(2.0) // Texture tiling scale
+            .with_triplanar_sharpness(4.0), // Moderate triplanar sharpness
     };
 
     let material_handle = materials.add(material);
@@ -89,11 +147,12 @@ fn setup(
         ..default()
     });
 
-    // Spawn camera
+    // Spawn camera with 4x MSAA for smoother rendering
     commands.spawn((
         Camera3d::default(),
         Transform::from_xyz(15.0, 10.0, 15.0).looking_at(Vec3::ZERO, Vec3::Y),
         CameraController { angle: 0.0 },
+        Msaa::Sample4,
     ));
 
     info!("PlumeSplat basic example running!");
@@ -102,7 +161,7 @@ fn setup(
     info!("Now using ExtendedMaterial for proper PBR lighting!");
 }
 
-/// Convert the loaded stacked 2D texture into a 2D array texture
+/// Convert the loaded stacked 2D texture into a 2D array texture with mipmaps
 fn convert_texture_to_array(
     mut texture_handle: ResMut<TextureArrayHandle>,
     mut images: ResMut<Assets<Image>>,
@@ -112,12 +171,153 @@ fn convert_texture_to_array(
     }
 
     if let Some(image) = images.get_mut(&texture_handle.handle) {
-        // Convert stacked 2D image to 2D array with 4 layers
         const NUM_LAYERS: u32 = 4;
-        image.reinterpret_stacked_2d_as_array(NUM_LAYERS);
-        info!("Converted texture to 2D array with {} layers", NUM_LAYERS);
+
+        // Get source dimensions (stacked vertically)
+        let src_width = image.texture_descriptor.size.width;
+        let src_height = image.texture_descriptor.size.height;
+        let layer_height = src_height / NUM_LAYERS;
+
+        // Calculate number of mip levels
+        let mip_count = (layer_height.min(src_width) as f32).log2().floor() as u32 + 1;
+
+        info!(
+            "Generating {} mip levels for {}x{} texture array with {} layers",
+            mip_count, src_width, layer_height, NUM_LAYERS
+        );
+
+        // Get source data
+        let src_data = image.data.as_ref().expect("Image should have data");
+
+        // Generate mipmapped texture array
+        let mipmapped_data =
+            generate_mipmaps_for_array(src_data, src_width, layer_height, NUM_LAYERS, mip_count);
+
+        // Update image with mipmapped data
+        image.data = Some(mipmapped_data);
+        image.texture_descriptor.size = Extent3d {
+            width: src_width,
+            height: layer_height,
+            depth_or_array_layers: NUM_LAYERS,
+        };
+        image.texture_descriptor.dimension = TextureDimension::D2;
+        image.texture_descriptor.mip_level_count = mip_count;
+
+        // Configure sampler with anisotropic filtering for quality
+        image.sampler =
+            bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
+                address_mode_u: bevy::image::ImageAddressMode::Repeat,
+                address_mode_v: bevy::image::ImageAddressMode::Repeat,
+                address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
+                mag_filter: bevy::image::ImageFilterMode::Linear,
+                min_filter: bevy::image::ImageFilterMode::Linear,
+                mipmap_filter: bevy::image::ImageFilterMode::Linear,
+                anisotropy_clamp: 16,
+                ..default()
+            });
+
+        info!(
+            "Converted texture to 2D array with {} layers and {} mip levels",
+            NUM_LAYERS, mip_count
+        );
         texture_handle.converted = true;
     }
+}
+
+/// Generate mipmaps for a texture array
+/// Data layout for 2D array with mipmaps (wgpu expects): Layer0Mip0, Layer0Mip1, ..., Layer1Mip0, Layer1Mip1, ...
+fn generate_mipmaps_for_array(
+    src_data: &[u8],
+    width: u32,
+    layer_height: u32,
+    num_layers: u32,
+    mip_count: u32,
+) -> Vec<u8> {
+    let bytes_per_pixel = 4u32; // RGBA8
+    let mut result = Vec::new();
+
+    // Process each layer
+    for layer in 0..num_layers {
+        // Extract this layer's data from the stacked source
+        let layer_start = (layer * layer_height * width * bytes_per_pixel) as usize;
+        let layer_end = ((layer + 1) * layer_height * width * bytes_per_pixel) as usize;
+        let layer_data: Vec<u8> = src_data[layer_start..layer_end].to_vec();
+
+        // Generate mip chain for this layer
+        let mut current_data = layer_data;
+        let mut current_width = width;
+        let mut current_height = layer_height;
+
+        for mip in 0..mip_count {
+            // Add current mip level data
+            result.extend_from_slice(&current_data);
+
+            // Generate next mip level (if not the last)
+            if mip < mip_count - 1 {
+                let next_width = (current_width / 2).max(1);
+                let next_height = (current_height / 2).max(1);
+                current_data = downsample_rgba(
+                    &current_data,
+                    current_width,
+                    current_height,
+                    next_width,
+                    next_height,
+                );
+                current_width = next_width;
+                current_height = next_height;
+            }
+        }
+    }
+
+    result
+}
+
+/// Downsample RGBA image using box filter (simple average)
+fn downsample_rgba(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+) -> Vec<u8> {
+    let mut dst = vec![0u8; (dst_width * dst_height * 4) as usize];
+
+    for dy in 0..dst_height {
+        for dx in 0..dst_width {
+            // Source coordinates (2x2 block)
+            let sx = dx * 2;
+            let sy = dy * 2;
+
+            // Sample up to 4 pixels and average
+            let mut r = 0u32;
+            let mut g = 0u32;
+            let mut b = 0u32;
+            let mut a = 0u32;
+            let mut count = 0u32;
+
+            for oy in 0..2 {
+                for ox in 0..2 {
+                    let px = (sx + ox).min(src_width - 1);
+                    let py = (sy + oy).min(src_height - 1);
+                    let idx = ((py * src_width + px) * 4) as usize;
+
+                    r += src[idx] as u32;
+                    g += src[idx + 1] as u32;
+                    b += src[idx + 2] as u32;
+                    a += src[idx + 3] as u32;
+                    count += 1;
+                }
+            }
+
+            let dst_idx = ((dy * dst_width + dx) * 4) as usize;
+            dst[dst_idx] = (r / count) as u8;
+            dst[dst_idx + 1] = (g / count) as u8;
+            dst[dst_idx + 2] = (b / count) as u8;
+            dst[dst_idx + 3] = (a / count) as u8;
+        }
+    }
+
+    dst
 }
 
 #[derive(Component)]
@@ -208,6 +408,7 @@ fn create_terrain_mesh(width: u32, height: u32, size: f32, max_height: f32) -> M
     }
 
     // Generate indices for triangles
+    // Use alternating diagonal pattern to reduce visible seams
     for z in 0..(height - 1) {
         for x in 0..(width - 1) {
             let top_left = z * width + x;
@@ -215,15 +416,26 @@ fn create_terrain_mesh(width: u32, height: u32, size: f32, max_height: f32) -> M
             let bottom_left = (z + 1) * width + x;
             let bottom_right = bottom_left + 1;
 
-            // First triangle
-            indices.push(top_left);
-            indices.push(bottom_left);
-            indices.push(top_right);
+            // Alternate diagonal direction based on position (checkerboard pattern)
+            if (x + z) % 2 == 0 {
+                // Diagonal from top-left to bottom-right
+                indices.push(top_left);
+                indices.push(bottom_left);
+                indices.push(top_right);
 
-            // Second triangle
-            indices.push(top_right);
-            indices.push(bottom_left);
-            indices.push(bottom_right);
+                indices.push(top_right);
+                indices.push(bottom_left);
+                indices.push(bottom_right);
+            } else {
+                // Diagonal from top-right to bottom-left
+                indices.push(top_left);
+                indices.push(bottom_left);
+                indices.push(bottom_right);
+
+                indices.push(top_left);
+                indices.push(bottom_right);
+                indices.push(top_right);
+            }
         }
     }
 
@@ -278,11 +490,11 @@ fn compute_material_blend(height: f32, max_height: f32) -> MaterialVertex {
 fn compute_material_blend_with_slope(height: f32, max_height: f32, slope: f32) -> MaterialVertex {
     let normalized_height = height / max_height;
 
-    // Base height-based weights
-    let grass = smooth_band(normalized_height, 0.0, 0.35, 0.1);
-    let dirt = smooth_band(normalized_height, 0.25, 0.55, 0.1);
-    let rock = smooth_band(normalized_height, 0.45, 0.85, 0.15);
-    let snow = smooth_band(normalized_height, 0.7, 1.0, 0.1);
+    // Base height-based weights with wider fade zones for smoother blending
+    let grass = smooth_band(normalized_height, 0.0, 0.4, 0.2);
+    let dirt = smooth_band(normalized_height, 0.2, 0.6, 0.2);
+    let rock = smooth_band(normalized_height, 0.4, 0.9, 0.25);
+    let snow = smooth_band(normalized_height, 0.65, 1.0, 0.2);
 
     // Steep slopes get more rock
     let slope_factor = (slope * 3.0).clamp(0.0, 1.0);

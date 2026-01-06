@@ -28,7 +28,8 @@ struct PlumeSplatVertexOutput {
     @location(2) uv: vec2<f32>,
     // Custom attributes for material splatting
     @location(10) @interpolate(flat) material_indices: u32,
-    @location(11) material_weights: u32,
+    // Weights unpacked to vec4<f32> for proper interpolation
+    @location(11) material_weights: vec4<f32>,
 }
 
 // Unpack 4 u8 values from a u32
@@ -41,16 +42,73 @@ fn unpack_u8x4(packed: u32) -> vec4<u32> {
     );
 }
 
+// Hash function for stochastic tiling
+fn hash2(p: vec2<f32>) -> vec2<f32> {
+    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
+    return fract(sin(q) * 43758.5453);
+}
+
+// Stochastic tiling - samples texture at 3 random offsets and blends based on proximity
+// This breaks up visible tiling patterns
+fn sample_stochastic(
+    tex: texture_2d_array<f32>,
+    tex_sampler: sampler,
+    uv: vec2<f32>,
+    layer: i32,
+    ddx_uv: vec2<f32>,
+    ddy_uv: vec2<f32>
+) -> vec4<f32> {
+    // Get integer tile coordinate
+    let tile = floor(uv);
+    let f = fract(uv);
+    
+    // Sample from 3 nearby tiles with random offsets
+    var color = vec4<f32>(0.0);
+    var total_weight = 0.0;
+    
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let offset = vec2<f32>(f32(i), f32(j));
+            let tile_pos = tile + offset;
+            
+            // Random offset for this tile (0-1 range)
+            let rand = hash2(tile_pos);
+            
+            // Offset UV within tile
+            let offset_uv = uv + rand;
+            
+            // Weight based on distance from tile center (smooth falloff)
+            let dist = f - offset + 0.5;
+            let weight = max(0.0, 1.0 - dot(dist, dist) * 2.0);
+            
+            if weight > 0.001 {
+                color += textureSampleGrad(tex, tex_sampler, offset_uv, layer, ddx_uv, ddy_uv) * weight;
+                total_weight += weight;
+            }
+        }
+    }
+    
+    return color / max(total_weight, 0.001);
+}
+
 // Compute triplanar blend weights from world normal
+// Uses squared weights for smoother falloff, then applies sharpness
 fn triplanar_weights(world_normal: vec3<f32>, sharpness: f32) -> vec3<f32> {
-    var weights = abs(world_normal);
-    weights = pow(weights, vec3<f32>(sharpness));
+    // Square the absolute normal components for initial weights
+    var weights = world_normal * world_normal;
+    
+    // Apply additional sharpness power if needed
+    if sharpness > 1.0 {
+        weights = pow(weights, vec3<f32>(sharpness * 0.5));
+    }
+    
+    // Normalize
     let sum = weights.x + weights.y + weights.z;
     return weights / max(sum, 0.0001);
 }
 
-// Sample texture array using triplanar projection
-fn sample_triplanar(
+// Sample at a single scale with triplanar + stochastic
+fn sample_triplanar_single_scale(
     world_pos: vec3<f32>,
     world_normal: vec3<f32>,
     layer: i32,
@@ -60,27 +118,60 @@ fn sample_triplanar(
     let weights = triplanar_weights(world_normal, sharpness);
     let scaled_pos = world_pos * uv_scale;
 
-    // Compute UVs with proper axis orientation to prevent mirroring
-    var uv_x = scaled_pos.zy;
-    if world_normal.x < 0.0 {
-        uv_x.x = -uv_x.x;
-    }
+    // X projection: YZ plane (for surfaces facing +/- X)
+    let uv_x = scaled_pos.yz;
+    // Y projection: XZ plane (for surfaces facing +/- Y) - main terrain projection
+    let uv_y = scaled_pos.xz;
+    // Z projection: XY plane (for surfaces facing +/- Z)
+    let uv_z = scaled_pos.xy;
 
-    var uv_y = scaled_pos.xz;
-    if world_normal.y < 0.0 {
-        uv_y.y = -uv_y.y;
-    }
+    // Compute smooth derivatives from world position (these are continuous across triangles)
+    let dpdx_pos = dpdx(scaled_pos);
+    let dpdy_pos = dpdy(scaled_pos);
+    
+    // Derive UV gradients from world position gradients
+    let ddx_x = dpdx_pos.yz;
+    let ddy_x = dpdy_pos.yz;
+    let ddx_y = dpdx_pos.xz;
+    let ddy_y = dpdy_pos.xz;
+    let ddx_z = dpdx_pos.xy;
+    let ddy_z = dpdy_pos.xy;
 
-    var uv_z = scaled_pos.xy;
-    if world_normal.z < 0.0 {
-        uv_z.x = -uv_z.x;
-    }
-
-    let sample_x = textureSample(albedo_array, albedo_array_sampler, uv_x, layer);
-    let sample_y = textureSample(albedo_array, albedo_array_sampler, uv_y, layer);
-    let sample_z = textureSample(albedo_array, albedo_array_sampler, uv_z, layer);
+    // Sample with stochastic tiling to break up repetition patterns
+    let sample_x = sample_stochastic(albedo_array, albedo_array_sampler, uv_x, layer, ddx_x, ddy_x);
+    let sample_y = sample_stochastic(albedo_array, albedo_array_sampler, uv_y, layer, ddx_y, ddy_y);
+    let sample_z = sample_stochastic(albedo_array, albedo_array_sampler, uv_z, layer, ddx_z, ddy_z);
 
     return sample_x * weights.x + sample_y * weights.y + sample_z * weights.z;
+}
+
+// Sample texture array using triplanar projection with multi-scale blending
+// Blends 3 different scales to break up visible repetition
+fn sample_triplanar(
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+    layer: i32,
+    uv_scale: f32,
+    sharpness: f32
+) -> vec4<f32> {
+    // Sample at 3 different scales
+    let scale1 = uv_scale;        // Base scale
+    let scale2 = uv_scale * 0.37; // Medium scale (use prime-ish ratio to avoid alignment)
+    let scale3 = uv_scale * 0.11; // Large scale for overall variation
+    
+    let sample1 = sample_triplanar_single_scale(world_pos, world_normal, layer, scale1, sharpness);
+    let sample2 = sample_triplanar_single_scale(world_pos, world_normal, layer, scale2, sharpness);
+    let sample3 = sample_triplanar_single_scale(world_pos, world_normal, layer, scale3, sharpness);
+    
+    // Blend scales together
+    // Use overlay-style blending: detail from small scale, color variation from large scales
+    let base_color = sample3 * 0.3 + sample2 * 0.35 + sample1 * 0.35;
+    
+    // Add detail contrast from the fine scale
+    let detail = sample1 - vec4<f32>(0.5);
+    let final_color = base_color + detail * 0.3;
+    
+    return clamp(final_color, vec4<f32>(0.0), vec4<f32>(1.0));
 }
 
 // Height-based blending for better transitions
@@ -125,7 +216,10 @@ fn vertex(
     out.world_normal = mesh_functions::mesh_normal_local_to_world(normal, instance_index);
     out.uv = uv;
     out.material_indices = material_indices;
-    out.material_weights = material_weights;
+    
+    // Unpack weights to vec4<f32> for proper interpolation across the triangle
+    let raw_weights = unpack_u8x4(material_weights);
+    out.material_weights = vec4<f32>(raw_weights) / 255.0;
 
     return out;
 }
@@ -144,20 +238,27 @@ fn fragment(
         world_normal = -world_normal;
     }
 
-    // Unpack material data
+    // Unpack material indices (flat interpolated - same for whole triangle)
     let indices = unpack_u8x4(in.material_indices);
     let idx0 = i32(indices.x);
     let idx1 = i32(indices.y);
     let idx2 = i32(indices.z);
     let idx3 = i32(indices.w);
 
-    let raw_weights = unpack_u8x4(in.material_weights);
-    var weights = vec4<f32>(raw_weights) / 255.0;
+    // Weights are already unpacked in vertex shader and properly interpolated
+    var weights = in.material_weights;
 
-    // Sample each material layer with triplanar mapping
+    // Normalize weights
+    let sum = weights.x + weights.y + weights.z + weights.w;
+    if sum > 0.0 {
+        weights = weights / sum;
+    }
+
+    // Full terrain rendering with material blending
     let uv_scale = settings.uv_scale;
     let sharpness = settings.triplanar_sharpness;
-
+    
+    // Sample each material layer
     let albedo0 = sample_triplanar(world_pos, world_normal, idx0, uv_scale, sharpness);
     let albedo1 = sample_triplanar(world_pos, world_normal, idx1, uv_scale, sharpness);
     let albedo2 = sample_triplanar(world_pos, world_normal, idx2, uv_scale, sharpness);
@@ -167,37 +268,44 @@ fn fragment(
     if settings.height_blend_sharpness > 0.0 {
         let heights = vec4<f32>(albedo0.a, albedo1.a, albedo2.a, albedo3.a);
         weights = height_blend(heights, weights, settings.height_blend_sharpness);
-    } else {
-        let sum = weights.x + weights.y + weights.z + weights.w;
-        if sum > 0.0 {
-            weights = weights / sum;
-        }
     }
 
     // Blend final albedo
     let final_albedo = albedo0 * weights.x + albedo1 * weights.y +
                        albedo2 * weights.z + albedo3 * weights.w;
-
-    // Construct VertexOutput for PBR functions
-    var vertex_out: VertexOutput;
-    vertex_out.position = in.position;
-    vertex_out.world_position = in.world_position;
-    vertex_out.world_normal = in.world_normal;
-    vertex_out.uv = in.uv;
-
-    // Generate PBR input from standard material
-    var pbr_input = pbr_input_from_standard_material(vertex_out, is_front);
-
-    // Override the base color with our splatted texture
-    pbr_input.material.base_color = final_albedo;
-
-    // Apply alpha discard if needed
-    pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
-
-    // Apply full PBR lighting
+    
+    // Simple lighting
+    let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.4));
+    let ndotl = max(dot(world_normal, light_dir), 0.0);
+    let ambient = 0.3;
+    let diffuse = ndotl * 0.7;
+    let lit_color = (ambient + diffuse) * final_albedo.rgb;
+    
     var out: FragmentOutput;
-    out.color = apply_pbr_lighting(pbr_input);
-    out.color = main_pass_post_lighting_processing(pbr_input, out.color);
-
+    out.color = vec4<f32>(lit_color, 1.0);
     return out;
+
+    // FULL PBR (uncomment when textures are verified working):
+    // // Construct VertexOutput for PBR functions
+    // var vertex_out: VertexOutput;
+    // vertex_out.position = in.position;
+    // vertex_out.world_position = in.world_position;
+    // vertex_out.world_normal = in.world_normal;
+    // vertex_out.uv = in.uv;
+    //
+    // // Generate PBR input from standard material
+    // var pbr_input = pbr_input_from_standard_material(vertex_out, is_front);
+    //
+    // // Override the base color with our splatted texture
+    // pbr_input.material.base_color = final_albedo;
+    //
+    // // Apply alpha discard if needed
+    // pbr_input.material.base_color = alpha_discard(pbr_input.material, pbr_input.material.base_color);
+    //
+    // // Apply full PBR lighting
+    // var out: FragmentOutput;
+    // out.color = apply_pbr_lighting(pbr_input);
+    // out.color = main_pass_post_lighting_processing(pbr_input, out.color);
+    //
+    // return out;
 }
