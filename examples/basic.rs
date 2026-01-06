@@ -133,7 +133,9 @@ fn setup(
             .with_normal_array(normal_handle)
             .with_pbr_array(pbr_handle) // PBR textures (metallic, roughness, AO)
             .with_uv_scale(2.0) // Texture tiling scale
-            .with_triplanar_sharpness(4.0), // Moderate triplanar sharpness
+            .with_triplanar_sharpness(4.0) // Moderate triplanar sharpness
+            .with_blend_offset(0.1) // Slight offset for sharper material transitions
+            .with_blend_exponent(2.0), // Squared weights for more defined boundaries
     };
 
     let material_handle = materials.add(material);

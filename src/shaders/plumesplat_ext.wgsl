@@ -7,6 +7,7 @@
     view_transformations::position_world_to_clip,
     pbr_fragment::pbr_input_from_standard_material,
     pbr_functions::{alpha_discard, apply_pbr_lighting, main_pass_post_lighting_processing},
+    mesh_view_bindings::view,
 }
 
 // Extension bindings - using bindless/shader_defs compatible syntax
@@ -17,6 +18,8 @@ struct PlumeSplatSettings {
     uv_scale: f32,
     triplanar_sharpness: f32,
     height_blend_sharpness: f32,
+    blend_offset: f32,
+    blend_exponent: f32,
 }
 @group(#{MATERIAL_BIND_GROUP}) @binding(102) var<uniform> settings: PlumeSplatSettings;
 
@@ -203,6 +206,32 @@ fn height_blend(heights: vec4<f32>, weights: vec4<f32>, sharpness: f32) -> vec4<
         return blend / sum;
     }
     return weights;
+}
+
+// Apply blend weight adjustments (offset and exponent) for sharper material transitions
+// Inspired by MegaSplat's blend weight controls
+fn adjust_blend_weights(weights: vec4<f32>, offset: f32, exponent: f32) -> vec4<f32> {
+    // Apply offset - subtract from all weights, reducing influence of weaker materials
+    var adjusted = max(weights - vec4<f32>(offset), vec4<f32>(0.0));
+    
+    // Apply exponent - raise to power for sharper transitions
+    // Only apply if exponent > 1.0 (exponent of 1.0 = no change)
+    if exponent > 1.0 {
+        adjusted = pow(adjusted, vec4<f32>(exponent));
+    }
+    
+    // Renormalize so weights sum to 1.0
+    let sum = adjusted.x + adjusted.y + adjusted.z + adjusted.w;
+    if sum > 0.0 {
+        return adjusted / sum;
+    }
+    
+    // Fallback: if all weights became zero, return original normalized weights
+    let orig_sum = weights.x + weights.y + weights.z + weights.w;
+    if orig_sum > 0.0 {
+        return weights / orig_sum;
+    }
+    return vec4<f32>(1.0, 0.0, 0.0, 0.0);
 }
 
 // Sample normal map with stochastic tiling (similar to albedo sampling)
@@ -453,6 +482,9 @@ fn fragment(
     if sum > 0.0 {
         weights = weights / sum;
     }
+    
+    // Apply blend weight adjustments (offset and exponent) for sharper transitions
+    weights = adjust_blend_weights(weights, settings.blend_offset, settings.blend_exponent);
 
     // Full terrain rendering with material blending
     let uv_scale = settings.uv_scale;
@@ -464,7 +496,7 @@ fn fragment(
     let albedo2 = sample_triplanar(world_pos, geometry_normal, idx2, uv_scale, sharpness);
     let albedo3 = sample_triplanar(world_pos, geometry_normal, idx3, uv_scale, sharpness);
 
-    // Optional height-based blending
+    // Optional height-based blending (applied after offset/exponent)
     if settings.height_blend_sharpness > 0.0 {
         let heights = vec4<f32>(albedo0.a, albedo1.a, albedo2.a, albedo3.a);
         weights = height_blend(heights, weights, settings.height_blend_sharpness);
@@ -503,8 +535,8 @@ fn fragment(
                    pbr2.ao * weights.z + pbr3.ao * weights.w;
     
     // PBR Lighting calculation
-    // View direction (approximated - would need camera position for accuracy)
-    let view_dir = normalize(vec3<f32>(0.0, 1.0, 0.5));
+    // View direction - from fragment to camera (using actual camera position from view bindings)
+    let view_dir = normalize(view.world_position - world_pos);
     
     // Light direction and color
     let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.4));

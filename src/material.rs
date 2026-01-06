@@ -68,7 +68,7 @@ pub struct PlumeSplatExtension {
 }
 
 /// Settings for the PlumeSplat shader.
-#[derive(Debug, Clone, Copy, Default, ShaderType)]
+#[derive(Debug, Clone, Copy, ShaderType)]
 pub struct PlumeSplatSettings {
     /// UV scale for triplanar mapping (higher = more tiling)
     pub uv_scale: f32,
@@ -76,6 +76,26 @@ pub struct PlumeSplatSettings {
     pub triplanar_sharpness: f32,
     /// Height blend sharpness (0.0 to disable)
     pub height_blend_sharpness: f32,
+    /// Blend offset - subtracts from weights before normalization.
+    /// Higher values create sharper transitions by reducing influence of weaker materials.
+    /// Range: 0.0 to 0.5 (max safe value before weights can all become zero)
+    pub blend_offset: f32,
+    /// Blend exponent - raises weights to this power before normalization.
+    /// Higher values create sharper transitions (1.0 = linear, 2.0+ = sharper)
+    /// Range: 1.0 to 8.0
+    pub blend_exponent: f32,
+}
+
+impl Default for PlumeSplatSettings {
+    fn default() -> Self {
+        Self {
+            uv_scale: 1.0,
+            triplanar_sharpness: 4.0,
+            height_blend_sharpness: 0.0,
+            blend_offset: 0.0,
+            blend_exponent: 1.0,
+        }
+    }
 }
 
 impl Default for PlumeSplatExtension {
@@ -84,11 +104,7 @@ impl Default for PlumeSplatExtension {
             albedo_array: Handle::default(),
             normal_array: None,
             pbr_array: None,
-            settings: PlumeSplatSettings {
-                uv_scale: 1.0,
-                triplanar_sharpness: 4.0, // Higher for sharper transitions on steep slopes
-                height_blend_sharpness: 0.0,
-            },
+            settings: PlumeSplatSettings::default(),
         }
     }
 }
@@ -129,6 +145,32 @@ impl PlumeSplatExtension {
     /// Set the packed PBR texture array (R=Metallic, G=Roughness, B=AO, A=Height).
     pub fn with_pbr_array(mut self, pbr_array: Handle<Image>) -> Self {
         self.pbr_array = Some(pbr_array);
+        self
+    }
+
+    /// Set the blend offset for material weight adjustment.
+    ///
+    /// Subtracts this value from all weights before normalization, causing
+    /// weaker materials to have less influence. Higher values create sharper
+    /// transitions between materials.
+    ///
+    /// Range: 0.0 (no offset) to 0.5 (maximum safe offset)
+    /// Default: 0.0
+    pub fn with_blend_offset(mut self, offset: f32) -> Self {
+        self.settings.blend_offset = offset.clamp(0.0, 0.5);
+        self
+    }
+
+    /// Set the blend exponent for material weight adjustment.
+    ///
+    /// Raises weights to this power before normalization. Higher values
+    /// create sharper transitions between materials by emphasizing
+    /// the dominant material.
+    ///
+    /// Range: 1.0 (linear) to 8.0 (very sharp)
+    /// Default: 1.0
+    pub fn with_blend_exponent(mut self, exponent: f32) -> Self {
+        self.settings.blend_exponent = exponent.clamp(1.0, 8.0);
         self
     }
 }
