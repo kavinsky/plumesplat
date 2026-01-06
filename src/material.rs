@@ -30,8 +30,9 @@ pub type PlumeSplatMaterial = ExtendedMaterial<StandardMaterial, PlumeSplatExten
 /// ## Texture Arrays
 ///
 /// The extension expects texture arrays where each layer represents a different material:
-/// - `albedo_array`: Base color textures (RGBA)
+/// - `albedo_array`: Base color textures (RGBA, A can store height for blending)
 /// - `normal_array`: Normal map textures (RGB, optional)
+/// - `pbr_array`: Packed PBR textures (R=Metallic, G=Roughness, B=AO, A=Height, optional)
 ///
 /// ## Vertex Attributes
 ///
@@ -50,6 +51,16 @@ pub struct PlumeSplatExtension {
     #[texture(103, dimension = "2d_array")]
     #[sampler(104, sampler_type = "filtering")]
     pub normal_array: Option<Handle<Image>>,
+
+    /// Packed PBR texture array. Each layer contains:
+    /// - R: Metallic (0.0 = dielectric, 1.0 = metal)
+    /// - G: Roughness (0.0 = smooth, 1.0 = rough)
+    /// - B: Ambient Occlusion (0.0 = occluded, 1.0 = not occluded)
+    /// - A: Height (for height-based blending, optional)
+    /// Optional - if not provided, default PBR values will be used.
+    #[texture(105, dimension = "2d_array")]
+    #[sampler(106, sampler_type = "filtering")]
+    pub pbr_array: Option<Handle<Image>>,
 
     /// Material configuration uniforms.
     #[uniform(102)]
@@ -72,6 +83,7 @@ impl Default for PlumeSplatExtension {
         Self {
             albedo_array: Handle::default(),
             normal_array: None,
+            pbr_array: None,
             settings: PlumeSplatSettings {
                 uv_scale: 1.0,
                 triplanar_sharpness: 4.0, // Higher for sharper transitions on steep slopes
@@ -111,6 +123,12 @@ impl PlumeSplatExtension {
     /// Set the normal map texture array.
     pub fn with_normal_array(mut self, normal_array: Handle<Image>) -> Self {
         self.normal_array = Some(normal_array);
+        self
+    }
+
+    /// Set the packed PBR texture array (R=Metallic, G=Roughness, B=AO, A=Height).
+    pub fn with_pbr_array(mut self, pbr_array: Handle<Image>) -> Self {
+        self.pbr_array = Some(pbr_array);
         self
     }
 }

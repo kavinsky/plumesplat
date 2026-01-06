@@ -24,6 +24,10 @@ struct PlumeSplatSettings {
 @group(#{MATERIAL_BIND_GROUP}) @binding(103) var normal_array: texture_2d_array<f32>;
 @group(#{MATERIAL_BIND_GROUP}) @binding(104) var normal_array_sampler: sampler;
 
+// PBR packed texture array: R=Metallic, G=Roughness, B=AO, A=Height (optional)
+@group(#{MATERIAL_BIND_GROUP}) @binding(105) var pbr_array: texture_2d_array<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(106) var pbr_array_sampler: sampler;
+
 // Extended vertex output with our custom material data
 struct PlumeSplatVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -300,6 +304,99 @@ fn blend_rnm(n1: vec3<f32>, n2: vec3<f32>) -> vec3<f32> {
     return normalize(t * dot(t, u) - u * t.z);
 }
 
+// PBR data structure
+struct PbrData {
+    metallic: f32,
+    roughness: f32,
+    ao: f32,
+    height: f32,
+}
+
+// Sample PBR texture with stochastic tiling
+fn sample_pbr_stochastic(
+    uv: vec2<f32>,
+    layer: i32,
+    ddx_uv: vec2<f32>,
+    ddy_uv: vec2<f32>
+) -> PbrData {
+    let tile = floor(uv);
+    let f = fract(uv);
+    
+    var pbr = vec4<f32>(0.0);
+    var total_weight = 0.0;
+    
+    for (var j = 0; j < 2; j++) {
+        for (var i = 0; i < 2; i++) {
+            let offset = vec2<f32>(f32(i), f32(j));
+            let tile_pos = tile + offset;
+            let rand = hash2(tile_pos);
+            let offset_uv = uv + rand;
+            
+            let dist = f - offset + 0.5;
+            let weight = max(0.0, 1.0 - dot(dist, dist) * 2.0);
+            
+            if weight > 0.001 {
+                let sampled = textureSampleGrad(pbr_array, pbr_array_sampler, offset_uv, layer, ddx_uv, ddy_uv);
+                pbr += sampled * weight;
+                total_weight += weight;
+            }
+        }
+    }
+    
+    pbr = pbr / max(total_weight, 0.001);
+    
+    return PbrData(pbr.r, pbr.g, pbr.b, pbr.a);
+}
+
+// Sample PBR at single scale with triplanar projection
+fn sample_pbr_triplanar_single_scale(
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+    layer: i32,
+    uv_scale: f32,
+    sharpness: f32
+) -> PbrData {
+    let weights = triplanar_weights(world_normal, sharpness);
+    let scaled_pos = world_pos * uv_scale;
+
+    let uv_x = scaled_pos.yz;
+    let uv_y = scaled_pos.xz;
+    let uv_z = scaled_pos.xy;
+
+    let dpdx_pos = dpdx(scaled_pos);
+    let dpdy_pos = dpdy(scaled_pos);
+    
+    let ddx_x = dpdx_pos.yz;
+    let ddy_x = dpdy_pos.yz;
+    let ddx_y = dpdx_pos.xz;
+    let ddy_y = dpdy_pos.xz;
+    let ddx_z = dpdx_pos.xy;
+    let ddy_z = dpdy_pos.xy;
+
+    let pbr_x = sample_pbr_stochastic(uv_x, layer, ddx_x, ddy_x);
+    let pbr_y = sample_pbr_stochastic(uv_y, layer, ddx_y, ddy_y);
+    let pbr_z = sample_pbr_stochastic(uv_z, layer, ddx_z, ddy_z);
+
+    // Blend PBR values based on triplanar weights
+    return PbrData(
+        pbr_x.metallic * weights.x + pbr_y.metallic * weights.y + pbr_z.metallic * weights.z,
+        pbr_x.roughness * weights.x + pbr_y.roughness * weights.y + pbr_z.roughness * weights.z,
+        pbr_x.ao * weights.x + pbr_y.ao * weights.y + pbr_z.ao * weights.z,
+        pbr_x.height * weights.x + pbr_y.height * weights.y + pbr_z.height * weights.z
+    );
+}
+
+// Sample PBR textures with triplanar projection
+fn sample_pbr_triplanar(
+    world_pos: vec3<f32>,
+    world_normal: vec3<f32>,
+    layer: i32,
+    uv_scale: f32,
+    sharpness: f32
+) -> PbrData {
+    return sample_pbr_triplanar_single_scale(world_pos, world_normal, layer, uv_scale, sharpness);
+}
+
 @vertex
 fn vertex(
     @builtin(instance_index) instance_index: u32,
@@ -378,27 +475,89 @@ fn fragment(
                        albedo2 * weights.z + albedo3 * weights.w;
     
     // Sample and blend normal maps
-    // Use geometry normal for triplanar projection, then perturb it with sampled normals
     let normal0 = sample_normal_triplanar(world_pos, geometry_normal, idx0, uv_scale, sharpness);
     let normal1 = sample_normal_triplanar(world_pos, geometry_normal, idx1, uv_scale, sharpness);
     let normal2 = sample_normal_triplanar(world_pos, geometry_normal, idx2, uv_scale, sharpness);
     let normal3 = sample_normal_triplanar(world_pos, geometry_normal, idx3, uv_scale, sharpness);
     
-    // Blend normals (linear blend then normalize - simple but effective)
+    // Blend normals
     var blended_normal = normal0 * weights.x + normal1 * weights.y +
                          normal2 * weights.z + normal3 * weights.w;
     blended_normal = normalize(blended_normal);
     
     // Combine sampled normal with geometry normal using RNM blending
-    // This perturbs the geometry normal by the detail from the normal map
     let final_normal = blend_rnm(geometry_normal, blended_normal);
     
-    // Simple lighting with normal mapped surface
+    // Sample and blend PBR textures
+    let pbr0 = sample_pbr_triplanar(world_pos, geometry_normal, idx0, uv_scale, sharpness);
+    let pbr1 = sample_pbr_triplanar(world_pos, geometry_normal, idx1, uv_scale, sharpness);
+    let pbr2 = sample_pbr_triplanar(world_pos, geometry_normal, idx2, uv_scale, sharpness);
+    let pbr3 = sample_pbr_triplanar(world_pos, geometry_normal, idx3, uv_scale, sharpness);
+    
+    // Blend PBR values
+    let final_metallic = pbr0.metallic * weights.x + pbr1.metallic * weights.y +
+                         pbr2.metallic * weights.z + pbr3.metallic * weights.w;
+    let final_roughness = pbr0.roughness * weights.x + pbr1.roughness * weights.y +
+                          pbr2.roughness * weights.z + pbr3.roughness * weights.w;
+    let final_ao = pbr0.ao * weights.x + pbr1.ao * weights.y +
+                   pbr2.ao * weights.z + pbr3.ao * weights.w;
+    
+    // PBR Lighting calculation
+    // View direction (approximated - would need camera position for accuracy)
+    let view_dir = normalize(vec3<f32>(0.0, 1.0, 0.5));
+    
+    // Light direction and color
     let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.4));
-    let ndotl = max(dot(final_normal, light_dir), 0.0);
-    let ambient = 0.3;
-    let diffuse = ndotl * 0.7;
-    let lit_color = (ambient + diffuse) * final_albedo.rgb;
+    let light_color = vec3<f32>(1.0, 0.98, 0.95); // Slightly warm sunlight
+    
+    // Half vector for specular
+    let half_vec = normalize(light_dir + view_dir);
+    
+    // Fresnel (Schlick approximation)
+    let f0 = mix(vec3<f32>(0.04), final_albedo.rgb, final_metallic);
+    let cos_theta = max(dot(half_vec, view_dir), 0.0);
+    let fresnel = f0 + (1.0 - f0) * pow(1.0 - cos_theta, 5.0);
+    
+    // Normal dot products
+    let n_dot_l = max(dot(final_normal, light_dir), 0.0);
+    let n_dot_v = max(dot(final_normal, view_dir), 0.0);
+    let n_dot_h = max(dot(final_normal, half_vec), 0.0);
+    
+    // Roughness for specular
+    let alpha = final_roughness * final_roughness;
+    let alpha2 = alpha * alpha;
+    
+    // GGX Distribution
+    let denom = n_dot_h * n_dot_h * (alpha2 - 1.0) + 1.0;
+    let distribution = alpha2 / (3.14159 * denom * denom + 0.0001);
+    
+    // Geometry (Schlick-GGX)
+    let k = (final_roughness + 1.0) * (final_roughness + 1.0) / 8.0;
+    let g1_l = n_dot_l / (n_dot_l * (1.0 - k) + k + 0.0001);
+    let g1_v = n_dot_v / (n_dot_v * (1.0 - k) + k + 0.0001);
+    let geometry = g1_l * g1_v;
+    
+    // Cook-Torrance BRDF
+    let specular = (distribution * geometry * fresnel) / (4.0 * n_dot_l * n_dot_v + 0.0001);
+    
+    // Diffuse (Lambertian with energy conservation)
+    let kd = (1.0 - fresnel) * (1.0 - final_metallic);
+    let diffuse = kd * final_albedo.rgb / 3.14159;
+    
+    // Final lighting
+    let direct_light = (diffuse + specular) * light_color * n_dot_l;
+    
+    // Ambient with AO
+    let ambient = vec3<f32>(0.15, 0.18, 0.22) * final_albedo.rgb * final_ao;
+    
+    // Combine
+    var lit_color = ambient + direct_light;
+    
+    // Simple tone mapping (Reinhard)
+    lit_color = lit_color / (lit_color + vec3<f32>(1.0));
+    
+    // Gamma correction (approximate)
+    lit_color = pow(lit_color, vec3<f32>(1.0 / 2.2));
     
     var out: FragmentOutput;
     out.color = vec4<f32>(lit_color, 1.0);

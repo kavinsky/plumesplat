@@ -85,8 +85,10 @@ struct TerrainMarker;
 struct TextureArrayHandles {
     albedo_handle: Handle<Image>,
     normal_handle: Option<Handle<Image>>,
+    pbr_handle: Option<Handle<Image>>,
     albedo_converted: bool,
     normal_converted: bool,
+    pbr_converted: bool,
 }
 
 fn setup(
@@ -105,12 +107,17 @@ fn setup(
     // Load normal maps (optional - comment out if not available)
     let normal_handle: Handle<Image> = asset_server.load("textures/terrain_normal_array.png");
 
+    // Load PBR packed textures (R=Metallic, G=Roughness, B=AO, A=Height)
+    let pbr_handle: Handle<Image> = asset_server.load("textures/terrain_pbr_array.png");
+
     // Store handles for conversion
     commands.insert_resource(TextureArrayHandles {
         albedo_handle: albedo_handle.clone(),
         normal_handle: Some(normal_handle.clone()),
+        pbr_handle: Some(pbr_handle.clone()),
         albedo_converted: false,
         normal_converted: false,
+        pbr_converted: false,
     });
 
     // Create ExtendedMaterial with StandardMaterial base + PlumeSplatExtension
@@ -124,6 +131,7 @@ fn setup(
         },
         extension: PlumeSplatExtension::new(albedo_handle)
             .with_normal_array(normal_handle)
+            .with_pbr_array(pbr_handle) // PBR textures (metallic, roughness, AO)
             .with_uv_scale(2.0) // Texture tiling scale
             .with_triplanar_sharpness(4.0), // Moderate triplanar sharpness
     };
@@ -239,6 +247,19 @@ fn convert_texture_to_array(
         } else {
             // No normal map provided, mark as done
             texture_handles.normal_converted = true;
+        }
+    }
+
+    // Convert PBR texture (if provided)
+    if !texture_handles.pbr_converted {
+        if let Some(ref pbr_handle) = texture_handles.pbr_handle {
+            if let Some(image) = images.get_mut(pbr_handle) {
+                convert_stacked_to_array(image, NUM_LAYERS, "pbr");
+                texture_handles.pbr_converted = true;
+            }
+        } else {
+            // No PBR map provided, mark as done
+            texture_handles.pbr_converted = true;
         }
     }
 }
