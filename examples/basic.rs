@@ -1,13 +1,11 @@
 //! Basic example demonstrating PlumeSplat terrain splatting.
 //!
 //! This example creates a simple terrain mesh with multiple materials
-//! blended based on height and slope.
+//! blended based on height and slope using the builder API.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
-use bevy::pbr::StandardMaterial;
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use plumesplat::prelude::*;
 
@@ -16,10 +14,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(PlumeSplatPlugin)
         .add_systems(Startup, setup)
-        .add_systems(
-            Update,
-            (convert_texture_to_array, rotate_camera, auto_screenshot),
-        )
+        .add_systems(Update, (rotate_camera, auto_screenshot))
         .run();
 }
 
@@ -76,76 +71,51 @@ fn auto_screenshot(
     }
 }
 
-/// Marker for the terrain entity so we can update its material
-#[derive(Component)]
-struct TerrainMarker;
-
-/// Resource to track the texture array handles
-#[derive(Resource)]
-struct TextureArrayHandles {
-    albedo_handle: Handle<Image>,
-    normal_handle: Option<Handle<Image>>,
-    pbr_handle: Option<Handle<Image>>,
-    albedo_converted: bool,
-    normal_converted: bool,
-    pbr_converted: bool,
-}
-
 fn setup(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
-    mut materials: ResMut<Assets<PlumeSplatMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
     // Create a terrain-like mesh (higher resolution for smoother blending)
     let terrain_mesh = create_terrain_mesh(128, 128, 10.0, 2.0);
     let mesh_handle = meshes.add(terrain_mesh);
 
-    // Load the stacked textures (4 layers stacked vertically: grass, dirt, rock, snow)
-    let albedo_handle: Handle<Image> = asset_server.load("textures/terrain_albedo_array.png");
+    // Define individual material layers using the builder API
+    // Each layer loads its own textures from the raw folder
+    let grass = MaterialLayer::new(asset_server.load("textures/raw/Grass004_1K-PNG_Color.png"))
+        .with_normal(asset_server.load("textures/raw/Grass004_1K-PNG_NormalGL.png"));
 
-    // Load normal maps (optional - comment out if not available)
-    let normal_handle: Handle<Image> = asset_server.load("textures/terrain_normal_array.png");
+    let dirt = MaterialLayer::new(asset_server.load("textures/raw/Ground054_1K-PNG_Color.png"))
+        .with_normal(asset_server.load("textures/raw/Ground054_1K-PNG_NormalGL.png"));
 
-    // Load PBR packed textures (R=Metallic, G=Roughness, B=AO, A=Height)
-    let pbr_handle: Handle<Image> = asset_server.load("textures/terrain_pbr_array.png");
+    let rock = MaterialLayer::new(asset_server.load("textures/raw/Rock051_1K-PNG_Color.png"))
+        .with_normal(asset_server.load("textures/raw/Rock051_1K-PNG_NormalGL.png"));
 
-    // Store handles for conversion
-    commands.insert_resource(TextureArrayHandles {
-        albedo_handle: albedo_handle.clone(),
-        normal_handle: Some(normal_handle.clone()),
-        pbr_handle: Some(pbr_handle.clone()),
-        albedo_converted: false,
-        normal_converted: false,
-        pbr_converted: false,
-    });
+    // Snow only has a diffuse texture available
+    let snow = MaterialLayer::new(asset_server.load("textures/raw/snow_diff.png"));
 
-    // Create ExtendedMaterial with StandardMaterial base + PlumeSplatExtension
-    let material = PlumeSplatMaterial {
-        base: StandardMaterial {
-            // Base material settings (used for lighting parameters)
-            perceptual_roughness: 0.8,
-            metallic: 0.0,
-            reflectance: 0.3,
-            ..default()
-        },
-        extension: PlumeSplatExtension::new(albedo_handle)
-            .with_normal_array(normal_handle)
-            .with_pbr_array(pbr_handle) // PBR textures (metallic, roughness, AO)
-            .with_uv_scale(2.0) // Texture tiling scale
-            .with_triplanar_sharpness(4.0) // Moderate triplanar sharpness
-            .with_blend_offset(0.1) // Slight offset for sharper material transitions
-            .with_blend_exponent(2.0), // Squared weights for more defined boundaries
-    };
+    // Build the pending material - it will automatically convert to a
+    // full PlumeSplatMaterial when all textures finish loading
+    let pending_material = SplatMaterialBuilder::new()
+        .add_layer(grass)
+        .add_layer(dirt)
+        .add_layer(rock)
+        .add_layer(snow)
+        .with_uv_scale(0.5)
+        .with_triplanar_sharpness(4.0)
+        .with_blend_offset(0.1)
+        .with_blend_exponent(2.0)
+        .build();
 
-    let material_handle = materials.add(material);
-
-    // Spawn terrain
+    // Spawn terrain with the pending material
+    // The PlumeSplatPlugin will automatically:
+    // 1. Wait for all textures to load
+    // 2. Combine them into texture arrays with mipmaps
+    // 3. Create and attach the final material
     commands.spawn((
         Mesh3d(mesh_handle),
-        MeshMaterial3d(material_handle),
+        pending_material,
         Transform::from_xyz(0.0, 0.0, 0.0),
-        TerrainMarker,
     ));
 
     // Spawn directional light (sun)
@@ -158,8 +128,8 @@ fn setup(
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.4, 0.0)),
     ));
 
-    // Ambient light
-    commands.insert_resource(AmbientLight {
+    // Ambient light (spawned as entity in Bevy 0.18+)
+    commands.spawn(AmbientLight {
         color: Color::WHITE,
         brightness: 200.0,
         ..default()
@@ -176,190 +146,7 @@ fn setup(
     info!("PlumeSplat basic example running!");
     info!("Terrain uses 4 materials: grass, dirt, rock, snow");
     info!("Materials blend based on height and slope.");
-    info!("Now using ExtendedMaterial for proper PBR lighting!");
-}
-
-/// Convert a stacked 2D texture into a 2D array texture with mipmaps
-fn convert_stacked_to_array(image: &mut Image, num_layers: u32, name: &str) {
-    // Get source dimensions (stacked vertically)
-    let src_width = image.texture_descriptor.size.width;
-    let src_height = image.texture_descriptor.size.height;
-    let layer_height = src_height / num_layers;
-
-    // Calculate number of mip levels
-    let mip_count = (layer_height.min(src_width) as f32).log2().floor() as u32 + 1;
-
-    info!(
-        "Generating {} mip levels for {}x{} {} array with {} layers",
-        mip_count, src_width, layer_height, name, num_layers
-    );
-
-    // Get source data
-    let src_data = image.data.as_ref().expect("Image should have data");
-
-    // Generate mipmapped texture array
-    let mipmapped_data =
-        generate_mipmaps_for_array(src_data, src_width, layer_height, num_layers, mip_count);
-
-    // Update image with mipmapped data
-    image.data = Some(mipmapped_data);
-    image.texture_descriptor.size = Extent3d {
-        width: src_width,
-        height: layer_height,
-        depth_or_array_layers: num_layers,
-    };
-    image.texture_descriptor.dimension = TextureDimension::D2;
-    image.texture_descriptor.mip_level_count = mip_count;
-
-    // Configure sampler with anisotropic filtering for quality
-    image.sampler = bevy::image::ImageSampler::Descriptor(bevy::image::ImageSamplerDescriptor {
-        address_mode_u: bevy::image::ImageAddressMode::Repeat,
-        address_mode_v: bevy::image::ImageAddressMode::Repeat,
-        address_mode_w: bevy::image::ImageAddressMode::ClampToEdge,
-        mag_filter: bevy::image::ImageFilterMode::Linear,
-        min_filter: bevy::image::ImageFilterMode::Linear,
-        mipmap_filter: bevy::image::ImageFilterMode::Linear,
-        anisotropy_clamp: 16,
-        ..default()
-    });
-}
-
-/// Convert the loaded stacked 2D textures into 2D array textures with mipmaps
-fn convert_texture_to_array(
-    mut texture_handles: ResMut<TextureArrayHandles>,
-    mut images: ResMut<Assets<Image>>,
-) {
-    const NUM_LAYERS: u32 = 4;
-
-    // Convert albedo texture
-    if !texture_handles.albedo_converted {
-        if let Some(image) = images.get_mut(&texture_handles.albedo_handle) {
-            convert_stacked_to_array(image, NUM_LAYERS, "albedo");
-            texture_handles.albedo_converted = true;
-        }
-    }
-
-    // Convert normal texture (if provided)
-    if !texture_handles.normal_converted {
-        if let Some(ref normal_handle) = texture_handles.normal_handle {
-            if let Some(image) = images.get_mut(normal_handle) {
-                convert_stacked_to_array(image, NUM_LAYERS, "normal");
-                texture_handles.normal_converted = true;
-            }
-        } else {
-            // No normal map provided, mark as done
-            texture_handles.normal_converted = true;
-        }
-    }
-
-    // Convert PBR texture (if provided)
-    if !texture_handles.pbr_converted {
-        if let Some(ref pbr_handle) = texture_handles.pbr_handle {
-            if let Some(image) = images.get_mut(pbr_handle) {
-                convert_stacked_to_array(image, NUM_LAYERS, "pbr");
-                texture_handles.pbr_converted = true;
-            }
-        } else {
-            // No PBR map provided, mark as done
-            texture_handles.pbr_converted = true;
-        }
-    }
-}
-
-/// Generate mipmaps for a texture array
-/// Data layout for 2D array with mipmaps (wgpu expects): Layer0Mip0, Layer0Mip1, ..., Layer1Mip0, Layer1Mip1, ...
-fn generate_mipmaps_for_array(
-    src_data: &[u8],
-    width: u32,
-    layer_height: u32,
-    num_layers: u32,
-    mip_count: u32,
-) -> Vec<u8> {
-    let bytes_per_pixel = 4u32; // RGBA8
-    let mut result = Vec::new();
-
-    // Process each layer
-    for layer in 0..num_layers {
-        // Extract this layer's data from the stacked source
-        let layer_start = (layer * layer_height * width * bytes_per_pixel) as usize;
-        let layer_end = ((layer + 1) * layer_height * width * bytes_per_pixel) as usize;
-        let layer_data: Vec<u8> = src_data[layer_start..layer_end].to_vec();
-
-        // Generate mip chain for this layer
-        let mut current_data = layer_data;
-        let mut current_width = width;
-        let mut current_height = layer_height;
-
-        for mip in 0..mip_count {
-            // Add current mip level data
-            result.extend_from_slice(&current_data);
-
-            // Generate next mip level (if not the last)
-            if mip < mip_count - 1 {
-                let next_width = (current_width / 2).max(1);
-                let next_height = (current_height / 2).max(1);
-                current_data = downsample_rgba(
-                    &current_data,
-                    current_width,
-                    current_height,
-                    next_width,
-                    next_height,
-                );
-                current_width = next_width;
-                current_height = next_height;
-            }
-        }
-    }
-
-    result
-}
-
-/// Downsample RGBA image using box filter (simple average)
-fn downsample_rgba(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_width * dst_height * 4) as usize];
-
-    for dy in 0..dst_height {
-        for dx in 0..dst_width {
-            // Source coordinates (2x2 block)
-            let sx = dx * 2;
-            let sy = dy * 2;
-
-            // Sample up to 4 pixels and average
-            let mut r = 0u32;
-            let mut g = 0u32;
-            let mut b = 0u32;
-            let mut a = 0u32;
-            let mut count = 0u32;
-
-            for oy in 0..2 {
-                for ox in 0..2 {
-                    let px = (sx + ox).min(src_width - 1);
-                    let py = (sy + oy).min(src_height - 1);
-                    let idx = ((py * src_width + px) * 4) as usize;
-
-                    r += src[idx] as u32;
-                    g += src[idx + 1] as u32;
-                    b += src[idx + 2] as u32;
-                    a += src[idx + 3] as u32;
-                    count += 1;
-                }
-            }
-
-            let dst_idx = ((dy * dst_width + dx) * 4) as usize;
-            dst[dst_idx] = (r / count) as u8;
-            dst[dst_idx + 1] = (g / count) as u8;
-            dst[dst_idx + 2] = (b / count) as u8;
-            dst[dst_idx + 3] = (a / count) as u8;
-        }
-    }
-
-    dst
+    info!("Using builder API for automatic texture array creation!");
 }
 
 #[derive(Component)]
