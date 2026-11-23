@@ -44,6 +44,7 @@
 
 use bevy::asset::{Asset, Handle};
 use bevy::image::Image;
+use bevy::math::Vec4;
 use bevy::mesh::{Mesh, MeshVertexBufferLayoutRef};
 use bevy::pbr::{
     ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
@@ -200,6 +201,73 @@ pub struct PlumeSplatExtension {
     /// See [`PlumeSplatSettings`] for details on each setting.
     #[uniform(102)]
     pub settings: PlumeSplatSettings,
+
+    /// Per-layer overrides of global settings (currently stochastic rotation).
+    ///
+    /// Every layer inherits the global value from [`settings`](Self::settings)
+    /// unless it has an override. The builder fills this from
+    /// [`MaterialLayer::with_rotation`](crate::MaterialLayer::with_rotation);
+    /// without the builder use [`with_layer_rotation`](Self::with_layer_rotation).
+    #[uniform(107)]
+    pub layer_settings: PlumeSplatLayerSettings,
+}
+
+/// Number of layers a material can address (material indices are `u8`).
+const LAYER_COUNT: usize = 256;
+
+/// Marker stored for "no override, use the global setting".
+const INHERIT: f32 = -1.0;
+
+/// Per-layer overrides of global [`PlumeSplatSettings`].
+///
+/// Each layer either **inherits** the global value (the default) or has its
+/// own **override**. Because inheritance is resolved in the shader, changing
+/// the global setting at runtime still affects every inheriting layer.
+///
+/// Currently holds the stochastic rotation override; more per-layer settings
+/// will use the same inherit / override rule.
+///
+/// # Example
+///
+/// ```rust
+/// use plumesplat::PlumeSplatLayerSettings;
+///
+/// let mut layers = PlumeSplatLayerSettings::default();
+/// layers.set_rotation(2, Some(0.0)); // layer 2: never rotated
+/// assert_eq!(layers.rotation(2), Some(0.0));
+/// assert_eq!(layers.rotation(0), None); // layer 0: inherits the global value
+/// ```
+#[derive(Debug, Clone, PartialEq, ShaderType)]
+pub struct PlumeSplatLayerSettings {
+    // One entry per layer. x = stochastic rotation override (negative =
+    // inherit); y, z, w reserved for future per-layer settings (also inherit).
+    layers: [Vec4; LAYER_COUNT],
+}
+
+impl Default for PlumeSplatLayerSettings {
+    fn default() -> Self {
+        Self {
+            layers: [Vec4::splat(INHERIT); LAYER_COUNT],
+        }
+    }
+}
+
+impl PlumeSplatLayerSettings {
+    /// Returns the stochastic rotation override of `layer`, or `None` if it
+    /// inherits [`PlumeSplatSettings::stochastic_rotation`].
+    #[must_use]
+    pub fn rotation(&self, layer: u8) -> Option<f32> {
+        let value = self.layers[layer as usize].x;
+        (value >= 0.0).then_some(value)
+    }
+
+    /// Sets the stochastic rotation override of `layer`.
+    ///
+    /// `Some(strength)` overrides the global value (clamped to 0.0-1.0;
+    /// 0.0 = never rotated). `None` makes the layer inherit the global value again.
+    pub fn set_rotation(&mut self, layer: u8, strength: Option<f32>) {
+        self.layers[layer as usize].x = strength.map_or(INHERIT, |s| s.clamp(0.0, 1.0));
+    }
 }
 
 /// Pipeline key: which optional arrays are bound, so the shader skips the missing ones.
@@ -320,8 +388,11 @@ pub struct PlumeSplatSettings {
     /// lighting stays correct. Costs a `sin`/`cos` per texture tap, no extra
     /// texture samples.
     ///
-    /// It applies to **every** layer: textures with a clear direction (layered
-    /// rock, planks, baked directional shadows) will look wrong when rotated.
+    /// This is the global value. Textures with a clear direction (layered rock,
+    /// planks, baked directional shadows) look wrong when rotated, so turn it
+    /// off for those layers with a per-layer override
+    /// ([`MaterialLayer::with_rotation`](crate::MaterialLayer::with_rotation) or
+    /// [`PlumeSplatExtension::with_layer_rotation`]).
     ///
     /// - **Default**: 0.0 (off)
     /// - **Range**: 0.0 (off) to 1.0 (any angle). 0.5 limits rotation to ±90°.
@@ -540,8 +611,8 @@ impl PlumeSplatExtension {
     /// Enables random per-tile rotation in stochastic tiling.
     ///
     /// Hides repetition much better for textures without a direction (grass,
-    /// dirt, sand). Applies to every layer, so avoid it if any layer has a clear
-    /// direction (layered rock, planks).
+    /// dirt, sand). This is the global value, used by every layer without an
+    /// override; see [`with_layer_rotation`](Self::with_layer_rotation).
     ///
     /// # Arguments
     ///
@@ -557,6 +628,32 @@ impl PlumeSplatExtension {
     /// ```
     pub fn with_stochastic_rotation(mut self, strength: f32) -> Self {
         self.settings.stochastic_rotation = strength.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Overrides the stochastic rotation of one layer (by texture array index).
+    ///
+    /// The layer uses `strength` instead of the global
+    /// [`stochastic_rotation`](PlumeSplatSettings::stochastic_rotation).
+    /// Use 0.0 for textures with a clear direction. With the builder, use
+    /// [`MaterialLayer::with_rotation`](crate::MaterialLayer::with_rotation) instead.
+    ///
+    /// # Arguments
+    ///
+    /// * `layer` - Layer index in the texture arrays
+    /// * `strength` - 0.0 (never rotated) to 1.0 (any angle); clamped to that range
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use plumesplat::PlumeSplatExtension;
+    /// # let albedo = bevy::asset::Handle::default();
+    /// let ext = PlumeSplatExtension::new(albedo)
+    ///     .with_stochastic_rotation(1.0) // every layer...
+    ///     .with_layer_rotation(2, 0.0);  // ...except layer 2
+    /// ```
+    pub fn with_layer_rotation(mut self, layer: u8, strength: f32) -> Self {
+        self.layer_settings.set_rotation(layer, Some(strength));
         self
     }
 }
@@ -619,6 +716,30 @@ mod tests {
         assert_eq!(settings.far_scale, 0.11);
         assert_eq!(settings.far_mix, 0.6);
         assert_eq!(settings.stochastic_rotation, 0.0);
+    }
+
+    #[test]
+    fn test_layer_rotation_inherits_by_default() {
+        let layers = PlumeSplatLayerSettings::default();
+        assert!((0..=255).all(|i| layers.rotation(i).is_none()));
+    }
+
+    #[test]
+    fn test_layer_rotation_override_and_reset() {
+        let ext = PlumeSplatExtension::default()
+            .with_layer_rotation(2, 0.0)
+            .with_layer_rotation(255, 2.0); // clamped
+        assert_eq!(ext.layer_settings.rotation(2), Some(0.0));
+        assert_eq!(ext.layer_settings.rotation(255), Some(1.0));
+        assert_eq!(ext.layer_settings.rotation(0), None);
+
+        let mut layers = ext.layer_settings;
+        layers.set_rotation(2, None);
+        assert_eq!(layers.rotation(2), None);
+
+        // Negative strengths clamp to 0.0 (an override), not to "inherit".
+        layers.set_rotation(3, Some(-1.0));
+        assert_eq!(layers.rotation(3), Some(0.0));
     }
 
     #[test]

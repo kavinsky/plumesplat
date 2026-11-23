@@ -160,6 +160,7 @@ fn process_pending_materials(
 
         let mut extension = PlumeSplatExtension::new(albedo_array);
         extension.settings = pending.settings;
+        extension.layer_settings = pending.layer_settings();
         extension.normal_array = normal_array;
         extension.pbr_array = pbr_array;
 

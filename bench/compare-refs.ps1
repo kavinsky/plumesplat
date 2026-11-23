@@ -10,6 +10,9 @@
   worktree for refs), so the scene and measurement code are identical. The ref
   must therefore have a library API compatible with bench/src/scene.rs.
 #>
+# No positional binding: otherwise, with only -Base given, the first forwarded
+# capture arg (e.g. --rounds) would bind to -Candidate.
+[CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory)] [string] $Base,
     # Empty = current working tree (including uncommitted changes).

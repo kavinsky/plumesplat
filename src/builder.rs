@@ -79,7 +79,7 @@ use bevy::ecs::component::Component;
 use bevy::image::Image;
 use bevy::pbr::StandardMaterial;
 
-use crate::material::PlumeSplatSettings;
+use crate::material::{PlumeSplatLayerSettings, PlumeSplatSettings};
 
 /// A single material layer defining textures for one terrain type.
 ///
@@ -136,6 +136,13 @@ pub struct MaterialLayer {
     /// - B: Ambient Occlusion (0.0 = occluded, 1.0 = not occluded)
     /// - A: Height (for height-based blending)
     pub pbr: Option<Handle<Image>>,
+
+    /// Stochastic rotation override for this layer (optional).
+    ///
+    /// `None` (the default) inherits the builder's global
+    /// [`with_stochastic_rotation`](SplatMaterialBuilder::with_stochastic_rotation)
+    /// value. `Some(strength)` uses its own value instead (0.0 = never rotated).
+    pub rotation: Option<f32>,
 }
 
 impl MaterialLayer {
@@ -161,6 +168,7 @@ impl MaterialLayer {
             albedo,
             normal: None,
             pbr: None,
+            rotation: None,
         }
     }
 
@@ -189,6 +197,34 @@ impl MaterialLayer {
     #[must_use]
     pub fn with_pbr(mut self, pbr: Handle<Image>) -> Self {
         self.pbr = Some(pbr);
+        self
+    }
+
+    /// Overrides the stochastic rotation for this layer.
+    ///
+    /// Without this, the layer uses the builder's global
+    /// [`with_stochastic_rotation`](SplatMaterialBuilder::with_stochastic_rotation)
+    /// value. Use 0.0 for textures with a clear direction (layered rock, planks),
+    /// or 1.0 to rotate only this layer while the global value stays off.
+    ///
+    /// # Arguments
+    ///
+    /// * `strength` - 0.0 (never rotated) to 1.0 (any angle); clamped to that range
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use bevy::prelude::*;
+    /// use plumesplat::MaterialLayer;
+    ///
+    /// fn setup(asset_server: Res<AssetServer>) {
+    ///     let rock = MaterialLayer::new(asset_server.load("rock.png"))
+    ///         .with_rotation(0.0); // streaky rock: never rotated
+    /// }
+    /// ```
+    #[must_use]
+    pub fn with_rotation(mut self, strength: f32) -> Self {
+        self.rotation = Some(strength.clamp(0.0, 1.0));
         self
     }
 
@@ -369,8 +405,9 @@ impl SplatMaterialBuilder {
     /// Enables random per-tile rotation in stochastic tiling.
     ///
     /// Hides repetition much better for textures without a direction (grass,
-    /// dirt, sand). Applies to every layer, so avoid it if any layer has a clear
-    /// direction (layered rock, planks).
+    /// dirt, sand). This is the global value, used by every layer without an
+    /// override. Turn it off for layers with a clear direction (layered rock,
+    /// planks) with [`MaterialLayer::with_rotation(0.0)`](MaterialLayer::with_rotation).
     ///
     /// - **Default**: 0.0 (off)
     /// - **Range**: 0.0 (off) to 1.0 (any angle)
@@ -568,6 +605,17 @@ impl PendingSplatMaterial {
     pub fn has_pbr(&self) -> bool {
         self.layers.iter().any(MaterialLayer::has_pbr)
     }
+
+    /// Per-layer overrides, indexed like the texture arrays (layer order).
+    #[must_use]
+    pub fn layer_settings(&self) -> PlumeSplatLayerSettings {
+        let mut settings = PlumeSplatLayerSettings::default();
+        // At most 256 layers (enforced by `add_layer`), so the index fits in u8.
+        for (index, layer) in self.layers.iter().enumerate() {
+            settings.set_rotation(index as u8, layer.rotation);
+        }
+        settings
+    }
 }
 
 #[cfg(test)]
@@ -672,5 +720,22 @@ mod tests {
         assert_eq!(pending.total_texture_count(), 5); // 2 albedo + 2 normal + 1 pbr
         assert!(pending.has_normals());
         assert!(pending.has_pbr());
+    }
+
+    #[test]
+    fn test_layer_rotation_overrides_follow_layer_order() {
+        let pending = SplatMaterialBuilder::new()
+            .add_layer(MaterialLayer::new(Handle::default())) // inherits
+            .add_layer(MaterialLayer::new(Handle::default()).with_rotation(0.0))
+            .add_layer(MaterialLayer::new(Handle::default()).with_rotation(5.0)) // clamped
+            .with_stochastic_rotation(1.0)
+            .build();
+
+        let layers = pending.layer_settings();
+        assert_eq!(layers.rotation(0), None);
+        assert_eq!(layers.rotation(1), Some(0.0));
+        assert_eq!(layers.rotation(2), Some(1.0));
+        assert_eq!(layers.rotation(3), None); // unused layers inherit too
+        assert_eq!(pending.settings.stochastic_rotation, 1.0);
     }
 }

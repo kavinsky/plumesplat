@@ -15,6 +15,7 @@ PlumeSplat is a high-performance terrain material blending library for the [Bevy
 - **Normal Maps** - Per-material normal mapping for surface detail
 - **Packed PBR Textures** - Support for metallic, roughness, ambient occlusion, and height maps
 - **Stochastic Tiling** - Eliminates visible texture repetition patterns
+- **Stochastic Rotation** - Optional random tile rotation, global or per layer
 - **Multi-Scale Blending** - Combines multiple texture frequencies to reduce repetition
 - **Height-Based Blending** - Natural material transitions based on height maps
 - **Configurable Blend Sharpness** - Control how materials transition at boundaries
@@ -101,6 +102,10 @@ let dirt = MaterialLayer::new(asset_server.load("dirt.png"))
 let rock = MaterialLayer::new(asset_server.load("rock.png"))
     .with_normal(asset_server.load("rock_normal.png"))
     .with_pbr(asset_server.load("rock_pbr.png"));
+
+// Override a global setting for one layer (here: never rotate this rock)
+let layered_rock = MaterialLayer::new(asset_server.load("layered_rock.png"))
+    .with_rotation(0.0);
 ```
 
 ### PBR Texture Format
@@ -130,7 +135,8 @@ let pending = SplatMaterialBuilder::new()
     .with_blend_exponent(2.0)
     // Multi-scale albedo: far sample scale and strength (0.0 strength = off)
     .with_multi_scale(0.11, 0.6)
-    // Random tile rotation (0.0 = off). Best for textures without a direction
+    // Random tile rotation (0.0 = off) for every layer without its own
+    // with_rotation() override. Best for textures without a direction
     .with_stochastic_rotation(1.0)
     // Custom base material settings
     .with_base_material(StandardMaterial {
@@ -151,7 +157,9 @@ let pending = SplatMaterialBuilder::new()
 | `blend_exponent` | 1.0 | 1.0-8.0 | Power applied to weights (higher = sharper) |
 | `far_scale` | 0.11 | 0.01-1.0 | Scale of the large-scale albedo sample, relative to `uv_scale` |
 | `far_mix` | 0.6 | 0.0-1.0 | Strength of the large-scale albedo sample (0 = off, skips it) |
-| `stochastic_rotation` | 0.0 | 0.0-1.0 | Random per-tile rotation (0 = off, 1 = any angle). Applies to all layers; avoid with directional textures |
+| `stochastic_rotation` | 0.0 | 0.0-1.0 | Random per-tile rotation (0 = off, 1 = any angle). Global value; layers can override it with `MaterialLayer::with_rotation` |
+
+See [docs/TILING_AND_VARIATION.md](docs/TILING_AND_VARIATION.md) for how stochastic tiling, rotation (global and per layer) and multi-scale sampling work together, with examples and comparison images.
 
 ## Vertex Attributes
 

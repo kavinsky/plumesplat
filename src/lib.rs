@@ -113,6 +113,7 @@ mod vertex_attributes;
 /// - [`PlumeSplatMaterial`] - Type alias for the extended material
 /// - [`PlumeSplatExtension`] - The material extension with texture arrays
 /// - [`PlumeSplatSettings`] - Shader uniform settings
+/// - [`PlumeSplatLayerSettings`] - Per-layer overrides of the settings
 /// - [`MaterialVertex`] - Per-vertex material data
 /// - [`ATTRIBUTE_MATERIAL_INDICES`] - Vertex attribute for material indices
 /// - [`ATTRIBUTE_MATERIAL_WEIGHTS`] - Vertex attribute for blend weights
@@ -122,7 +123,9 @@ mod vertex_attributes;
 /// - [`PendingSplatMaterial`] - Component for pending material processing
 pub mod prelude {
     pub use crate::builder::{MaterialLayer, PendingSplatMaterial, SplatMaterialBuilder};
-    pub use crate::material::{PlumeSplatExtension, PlumeSplatMaterial, PlumeSplatSettings};
+    pub use crate::material::{
+        PlumeSplatExtension, PlumeSplatLayerSettings, PlumeSplatMaterial, PlumeSplatSettings,
+    };
     pub use crate::plugin::PlumeSplatPlugin;
     pub use crate::vertex_attributes::{
         encode_material_data, MaterialVertex, ATTRIBUTE_MATERIAL_INDICES,

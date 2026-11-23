@@ -44,6 +44,13 @@ struct PlumeSplatSettings {
 @group(constants::MATERIAL_BIND_GROUP) @binding(105) var pbr_array: texture_2d_array<f32>;
 @group(constants::MATERIAL_BIND_GROUP) @binding(106) var pbr_sampler: sampler;
 
+// Per-layer overrides of `settings`, one vec4 per layer. A negative value means
+// "inherit the global setting". x = stochastic rotation; y, z, w reserved.
+struct PlumeSplatLayerSettings {
+    layers: array<vec4<f32>, 256>,
+}
+@group(constants::MATERIAL_BIND_GROUP) @binding(107) var<uniform> layer_settings: PlumeSplatLayerSettings;
+
 // Layers / projection planes below these weights are not sampled.
 const MIN_LAYER_WEIGHT: f32 = 0.01;
 const MIN_PLANE_WEIGHT: f32 = 0.01;
@@ -96,6 +103,12 @@ fn hash3(cell: vec2<f32>) -> vec3<f32> {
     return vec3<f32>(offset, rot);
 }
 
+// Stochastic rotation strength of a layer: its override, or the global value.
+fn layer_rotation(layer: i32) -> f32 {
+    let value = layer_settings.layers[layer].x;
+    return select(value, settings.stochastic_rotation, value < 0.0);
+}
+
 // Stochastic tiling: blend the 4 nearest tile centers, each with its own random
 // offset (and, with `stochastic_rotation`, its own random rotation). Weights are
 // bilinear (sharpened), so they reach 0 exactly at the point where a tile center
@@ -117,7 +130,7 @@ fn sample_stochastic(
     let g = uv - 0.5;
     let cell = floor(g);
     let b = clamp((fract(g) - 0.5) * 2.0 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
-    let rotation = settings.stochastic_rotation;
+    let rotation = layer_rotation(layer);
 
     var color = vec4<f32>(0.0);
     for (var j = 0; j < 2; j++) {
@@ -127,7 +140,9 @@ fn sample_stochastic(
             let w = axis_w.x * axis_w.y;
             if w > 0.0 {
                 let h = hash3(cell + o);
-                // Rotation is skipped entirely when off (uniform branch).
+                // Rotation is skipped entirely when off for this layer. Not a
+                // uniform branch (it depends on the layer), which is fine:
+                // textureSampleGrad takes explicit gradients.
                 var r = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);
                 if rotation > 0.0 {
                     let angle = (h.z - 0.5) * 6.2831853 * rotation;

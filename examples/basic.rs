@@ -35,7 +35,10 @@ fn setup(
         .with_normal(asset_server.load("textures/raw/Ground054_1K-PNG_NormalGL.png"));
 
     let rock = MaterialLayer::new(asset_server.load("textures/raw/Rock051_1K-PNG_Color.png"))
-        .with_normal(asset_server.load("textures/raw/Rock051_1K-PNG_NormalGL.png"));
+        .with_normal(asset_server.load("textures/raw/Rock051_1K-PNG_NormalGL.png"))
+        // This rock has strong streaks: random rotation would cross them, so
+        // this layer overrides the global stochastic rotation and is never rotated.
+        .with_rotation(0.0);
 
     // Snow only has a diffuse texture available
     let snow = MaterialLayer::new(asset_server.load("textures/raw/snow_diff.png"));
@@ -51,6 +54,9 @@ fn setup(
         .with_triplanar_sharpness(4.0)
         .with_blend_offset(0.1)
         .with_blend_exponent(2.0)
+        // Random tile rotation for every layer without an override (grass,
+        // dirt, snow), which hides repetition better than offsets alone.
+        .with_stochastic_rotation(1.0)
         .build();
 
     // Spawn terrain with the pending material
