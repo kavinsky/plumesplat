@@ -130,6 +130,8 @@ let pending = SplatMaterialBuilder::new()
     .with_blend_exponent(2.0)
     // Multi-scale albedo: far sample scale and strength (0.0 strength = off)
     .with_multi_scale(0.11, 0.6)
+    // Random tile rotation (0.0 = off). Best for textures without a direction
+    .with_stochastic_rotation(1.0)
     // Custom base material settings
     .with_base_material(StandardMaterial {
         perceptual_roughness: 0.8,
@@ -149,6 +151,7 @@ let pending = SplatMaterialBuilder::new()
 | `blend_exponent` | 1.0 | 1.0-8.0 | Power applied to weights (higher = sharper) |
 | `far_scale` | 0.11 | 0.01-1.0 | Scale of the large-scale albedo sample, relative to `uv_scale` |
 | `far_mix` | 0.6 | 0.0-1.0 | Strength of the large-scale albedo sample (0 = off, skips it) |
+| `stochastic_rotation` | 0.0 | 0.0-1.0 | Random per-tile rotation (0 = off, 1 = any angle). Applies to all layers; avoid with directional textures |
 
 ## Vertex Attributes
 

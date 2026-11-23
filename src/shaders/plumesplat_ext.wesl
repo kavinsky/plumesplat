@@ -32,6 +32,8 @@ struct PlumeSplatSettings {
     // strongly it modulates the near sample (0 = off, skips the far sample).
     far_scale: f32,
     far_mix: f32,
+    // Random per-tile rotation in stochastic tiling: 0 = off, 1 = full turn.
+    stochastic_rotation: f32,
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(102) var<uniform> settings: PlumeSplatSettings;
 
@@ -74,11 +76,11 @@ fn unpack_u8x4(packed: u32) -> vec4<u32> {
     return (vec4<u32>(packed) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(0xFFu);
 }
 
-// Random offset in [0, 1)^2 for an integer tile cell. Uses the pcg2d integer
-// hash (Jarzynski & Olano 2020) instead of a sin-based one: `sin` loses
-// precision for large arguments, which made the pattern blocky or repeat far
-// from the origin, and its result differed between GPU vendors.
-fn hash2(cell: vec2<f32>) -> vec2<f32> {
+// Random values in [0, 1) for an integer tile cell: xy = offset, z = rotation.
+// Uses the pcg2d integer hash (Jarzynski & Olano 2020) instead of a sin-based
+// one: `sin` loses precision for large arguments, which made the pattern blocky
+// or repeat far from the origin, and its result differed between GPU vendors.
+fn hash3(cell: vec2<f32>) -> vec3<f32> {
     var v = bitcast<vec2<u32>>(vec2<i32>(cell));
     v = v * 1664525u + 1013904223u;
     v.x += v.y * 1664525u;
@@ -87,14 +89,22 @@ fn hash2(cell: vec2<f32>) -> vec2<f32> {
     v.x += v.y * 1664525u;
     v.y += v.x * 1664525u;
     v = v ^ (v >> vec2<u32>(16u));
-    // Top 24 bits -> float in [0, 1), exact in f32.
-    return vec2<f32>(v >> vec2<u32>(8u)) * (1.0 / 16777216.0);
+    // Offset: top 24 bits of each word, exact in f32. Rotation: the 8 low bits
+    // of each word, which the offset doesn't use (16 bits, 65536 angles).
+    let offset = vec2<f32>(v >> vec2<u32>(8u)) * (1.0 / 16777216.0);
+    let rot = f32((v.x & 0xFFu) | ((v.y & 0xFFu) << 8u)) * (1.0 / 65536.0);
+    return vec3<f32>(offset, rot);
 }
 
 // Stochastic tiling: blend the 4 nearest tile centers, each with its own random
-// offset. Weights are bilinear (sharpened), so they reach 0 exactly at the point
-// where a tile center leaves the 2x2 neighbourhood: no seams. With the sharpening,
-// most pixels need 1 or 2 taps instead of 4.
+// offset (and, with `stochastic_rotation`, its own random rotation). Weights are
+// bilinear (sharpened), so they reach 0 exactly at the point where a tile center
+// leaves the 2x2 neighbourhood: no seams. With the sharpening, most pixels need
+// 1 or 2 taps instead of 4.
+//
+// `is_normal`: the texture holds tangent-space normals. They are returned
+// decoded (-1..1), with each tap's xy rotated back into the unrotated UV frame,
+// so the result is consistent with `uv` whatever the rotation.
 fn sample_stochastic(
     tex: texture_2d_array<f32>,
     tex_sampler: sampler,
@@ -102,10 +112,12 @@ fn sample_stochastic(
     layer: i32,
     ddx_uv: vec2<f32>,
     ddy_uv: vec2<f32>,
+    is_normal: bool,
 ) -> vec4<f32> {
     let g = uv - 0.5;
     let cell = floor(g);
     let b = clamp((fract(g) - 0.5) * 2.0 + 0.5, vec2<f32>(0.0), vec2<f32>(1.0));
+    let rotation = settings.stochastic_rotation;
 
     var color = vec4<f32>(0.0);
     for (var j = 0; j < 2; j++) {
@@ -114,7 +126,24 @@ fn sample_stochastic(
             let axis_w = mix(1.0 - b, b, o);
             let w = axis_w.x * axis_w.y;
             if w > 0.0 {
-                color += textureSampleGrad(tex, tex_sampler, uv + hash2(cell + o), layer, ddx_uv, ddy_uv) * w;
+                let h = hash3(cell + o);
+                // Rotation is skipped entirely when off (uniform branch).
+                var r = mat2x2<f32>(1.0, 0.0, 0.0, 1.0);
+                if rotation > 0.0 {
+                    let angle = (h.z - 0.5) * 6.2831853 * rotation;
+                    let c = cos(angle);
+                    let s = sin(angle);
+                    r = mat2x2<f32>(c, s, -s, c);
+                }
+                // Gradients must be rotated with the UV, or mip selection breaks.
+                var texel = textureSampleGrad(tex, tex_sampler, r * uv + h.xy, layer, r * ddx_uv, r * ddy_uv);
+                if is_normal {
+                    var nrm = texel.xyz * 2.0 - 1.0;
+                    // Inverse rotation (transpose) back to the unrotated frame.
+                    nrm = vec3<f32>(nrm.xy * r, nrm.z);
+                    texel = vec4<f32>(nrm, texel.w);
+                }
+                color += texel * w;
             }
         }
     }
@@ -134,13 +163,13 @@ fn sample_triplanar(
     let dy = t.dy * scale;
     var color = vec4<f32>(0.0);
     if t.w.x > MIN_PLANE_WEIGHT {
-        color += sample_stochastic(tex, tex_sampler, p.zy, layer, dx.zy, dy.zy) * t.w.x;
+        color += sample_stochastic(tex, tex_sampler, p.zy, layer, dx.zy, dy.zy, false) * t.w.x;
     }
     if t.w.y > MIN_PLANE_WEIGHT {
-        color += sample_stochastic(tex, tex_sampler, p.xz, layer, dx.xz, dy.xz) * t.w.y;
+        color += sample_stochastic(tex, tex_sampler, p.xz, layer, dx.xz, dy.xz, false) * t.w.y;
     }
     if t.w.z > MIN_PLANE_WEIGHT {
-        color += sample_stochastic(tex, tex_sampler, p.xy, layer, dx.xy, dy.xy) * t.w.z;
+        color += sample_stochastic(tex, tex_sampler, p.xy, layer, dx.xy, dy.xy, false) * t.w.z;
     }
     return color;
 }
@@ -190,15 +219,15 @@ fn sample_triplanar_normal(t: Triplanar, layer: i32) -> vec3<f32> {
     let n = t.n;
     var result = vec3<f32>(0.0);
     if t.w.x > MIN_PLANE_WEIGHT {
-        let a = sample_stochastic(normal_array, normal_sampler, t.p.zy, layer, t.dx.zy, t.dy.zy).xyz * 2.0 - 1.0;
+        let a = sample_stochastic(normal_array, normal_sampler, t.p.zy, layer, t.dx.zy, t.dy.zy, true).xyz;
         result += vec3<f32>(abs(a.z) * n.x, a.y + n.y, a.x + n.z) * t.w.x;
     }
     if t.w.y > MIN_PLANE_WEIGHT {
-        let a = sample_stochastic(normal_array, normal_sampler, t.p.xz, layer, t.dx.xz, t.dy.xz).xyz * 2.0 - 1.0;
+        let a = sample_stochastic(normal_array, normal_sampler, t.p.xz, layer, t.dx.xz, t.dy.xz, true).xyz;
         result += vec3<f32>(a.x + n.x, abs(a.z) * n.y, a.y + n.z) * t.w.y;
     }
     if t.w.z > MIN_PLANE_WEIGHT {
-        let a = sample_stochastic(normal_array, normal_sampler, t.p.xy, layer, t.dx.xy, t.dy.xy).xyz * 2.0 - 1.0;
+        let a = sample_stochastic(normal_array, normal_sampler, t.p.xy, layer, t.dx.xy, t.dy.xy, true).xyz;
         result += vec3<f32>(a.x + n.x, a.y + n.y, abs(a.z) * n.z) * t.w.z;
     }
     return normalize(result);

@@ -238,6 +238,7 @@ impl From<&PlumeSplatExtension> for PlumeSplatKey {
 ///     blend_exponent: 2.0,        // Squared weights
 ///     far_scale: 0.11,            // Far sample ~9x larger
 ///     far_mix: 0.6,               // Large-scale variation strength
+///     stochastic_rotation: 0.0,   // Random tile rotation (off)
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, ShaderType)]
@@ -310,6 +311,21 @@ pub struct PlumeSplatSettings {
     /// - **Default**: 0.6
     /// - **Range**: 0.0 (off; the far sample is skipped entirely) to 1.0 (full)
     pub far_mix: f32,
+
+    /// Random per-tile rotation in stochastic tiling.
+    ///
+    /// Each stochastic tile gets a random rotation on top of its random offset,
+    /// which hides repetition much better for textures without a direction
+    /// (grass, dirt, sand, gravel). Normal maps are rotated to match, so
+    /// lighting stays correct. Costs a `sin`/`cos` per texture tap, no extra
+    /// texture samples.
+    ///
+    /// It applies to **every** layer: textures with a clear direction (layered
+    /// rock, planks, baked directional shadows) will look wrong when rotated.
+    ///
+    /// - **Default**: 0.0 (off)
+    /// - **Range**: 0.0 (off) to 1.0 (any angle). 0.5 limits rotation to ±90°.
+    pub stochastic_rotation: f32,
 }
 
 impl Default for PlumeSplatSettings {
@@ -322,6 +338,7 @@ impl Default for PlumeSplatSettings {
             blend_exponent: 1.0,
             far_scale: 0.11,
             far_mix: 0.6,
+            stochastic_rotation: 0.0,
         }
     }
 }
@@ -519,6 +536,29 @@ impl PlumeSplatExtension {
         self.settings.set_multi_scale(far_scale, mix);
         self
     }
+
+    /// Enables random per-tile rotation in stochastic tiling.
+    ///
+    /// Hides repetition much better for textures without a direction (grass,
+    /// dirt, sand). Applies to every layer, so avoid it if any layer has a clear
+    /// direction (layered rock, planks).
+    ///
+    /// # Arguments
+    ///
+    /// * `strength` - 0.0 (off, default) to 1.0 (any angle); clamped to that range
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use plumesplat::PlumeSplatExtension;
+    /// # let albedo = bevy::asset::Handle::default();
+    /// let ext = PlumeSplatExtension::new(albedo)
+    ///     .with_stochastic_rotation(1.0);
+    /// ```
+    pub fn with_stochastic_rotation(mut self, strength: f32) -> Self {
+        self.settings.stochastic_rotation = strength.clamp(0.0, 1.0);
+        self
+    }
 }
 
 impl MaterialExtension for PlumeSplatExtension {
@@ -578,6 +618,19 @@ mod tests {
         assert_eq!(settings.blend_exponent, 1.0);
         assert_eq!(settings.far_scale, 0.11);
         assert_eq!(settings.far_mix, 0.6);
+        assert_eq!(settings.stochastic_rotation, 0.0);
+    }
+
+    #[test]
+    fn test_stochastic_rotation_clamping() {
+        let ext = PlumeSplatExtension::default().with_stochastic_rotation(0.5);
+        assert_eq!(ext.settings.stochastic_rotation, 0.5);
+
+        let ext = PlumeSplatExtension::default().with_stochastic_rotation(2.0);
+        assert_eq!(ext.settings.stochastic_rotation, 1.0);
+
+        let ext = PlumeSplatExtension::default().with_stochastic_rotation(-1.0);
+        assert_eq!(ext.settings.stochastic_rotation, 0.0);
     }
 
     #[test]

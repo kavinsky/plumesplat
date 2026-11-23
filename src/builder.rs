@@ -366,6 +366,20 @@ impl SplatMaterialBuilder {
         self
     }
 
+    /// Enables random per-tile rotation in stochastic tiling.
+    ///
+    /// Hides repetition much better for textures without a direction (grass,
+    /// dirt, sand). Applies to every layer, so avoid it if any layer has a clear
+    /// direction (layered rock, planks).
+    ///
+    /// - **Default**: 0.0 (off)
+    /// - **Range**: 0.0 (off) to 1.0 (any angle)
+    #[must_use]
+    pub fn with_stochastic_rotation(mut self, strength: f32) -> Self {
+        self.settings.stochastic_rotation = strength.clamp(0.0, 1.0);
+        self
+    }
+
     /// Sets the base [`StandardMaterial`] properties.
     ///
     /// These properties affect the overall material appearance and are
