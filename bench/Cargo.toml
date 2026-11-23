@@ -1,0 +1,17 @@
+[package]
+name = "plumesplat-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Visual + performance regression harness for plumesplat (not part of the published crate)"
+
+[[bin]]
+name = "plumesplat-bench"
+path = "src/main.rs"
+
+[dependencies]
+plumesplat = { path = ".." }
+bevy = { version = "0.20" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

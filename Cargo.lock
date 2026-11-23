@@ -4409,6 +4409,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "plumesplat-bench"
+version = "0.0.0"
+dependencies = [
+ "bevy",
+ "image",
+ "plumesplat",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "png"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
