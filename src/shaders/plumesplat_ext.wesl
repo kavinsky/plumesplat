@@ -28,6 +28,10 @@ struct PlumeSplatSettings {
     height_blend_sharpness: f32,
     blend_offset: f32,
     blend_exponent: f32,
+    // Multi-scale albedo: far sample scale (relative to uv_scale) and how
+    // strongly it modulates the near sample (0 = off, skips the far sample).
+    far_scale: f32,
+    far_mix: f32,
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(102) var<uniform> settings: PlumeSplatSettings;
 
@@ -41,10 +45,12 @@ struct PlumeSplatSettings {
 // Layers / projection planes below these weights are not sampled.
 const MIN_LAYER_WEIGHT: f32 = 0.01;
 const MIN_PLANE_WEIGHT: f32 = 0.01;
-// Second, larger albedo scale used to break up repetition, and how strongly it
-// modulates the near scale (0 = off, 1 = full).
-const FAR_SCALE: f32 = 0.11;
-const FAR_MIX: f32 = 0.6;
+// The far sample is rotated by this fixed angle (~37°, cos/sin below) so its
+// tile grid never lines up with the near grid's axes.
+const FAR_ROT: mat2x2<f32> = mat2x2<f32>(0.7986, 0.6018, -0.6018, 0.7986);
+// Upper bound on the far/average ratio, so layers whose average is very dark in
+// one channel can't blow that channel up.
+const FAR_MAX_RATIO: f32 = 4.0;
 
 struct SplatVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -139,15 +145,41 @@ fn sample_triplanar(
     return color;
 }
 
+// Triplanar albedo at the far scale: one plain tap per plane, no stochastic
+// tiling. The large scale change already hides the near tile pattern, and the
+// fixed rotation keeps the far grid off the near grid's axes, so this costs at
+// most 3 taps instead of up to 12.
+fn sample_albedo_far(t: Triplanar, scale: f32, layer: i32) -> vec3<f32> {
+    let p = t.p * scale;
+    let dx = t.dx * scale;
+    let dy = t.dy * scale;
+    var color = vec3<f32>(0.0);
+    if t.w.x > MIN_PLANE_WEIGHT {
+        color += textureSampleGrad(albedo_array, albedo_sampler, FAR_ROT * p.zy, layer, FAR_ROT * dx.zy, FAR_ROT * dy.zy).rgb * t.w.x;
+    }
+    if t.w.y > MIN_PLANE_WEIGHT {
+        color += textureSampleGrad(albedo_array, albedo_sampler, FAR_ROT * p.xz, layer, FAR_ROT * dx.xz, FAR_ROT * dy.xz).rgb * t.w.y;
+    }
+    if t.w.z > MIN_PLANE_WEIGHT {
+        color += textureSampleGrad(albedo_array, albedo_sampler, FAR_ROT * p.xy, layer, FAR_ROT * dx.xy, FAR_ROT * dy.xy).rgb * t.w.z;
+    }
+    return color;
+}
+
 // Albedo with large-scale variation. Averaging two scales would wash out the
 // texture's contrast, so the far sample only modulates the near one relative to
 // the layer's average color (its 1x1 top mip).
 fn sample_albedo(t: Triplanar, layer: i32) -> vec4<f32> {
     let near = sample_triplanar(albedo_array, albedo_sampler, t, 1.0, layer);
-    let far = sample_triplanar(albedo_array, albedo_sampler, t, FAR_SCALE, layer);
+    // Uniform branch; legal because every sample uses explicit gradients / LOD.
+    if settings.far_mix <= 0.0 {
+        return near;
+    }
+    let far = sample_albedo_far(t, settings.far_scale, layer);
     let top_mip = f32(textureNumLevels(albedo_array) - 1u);
-    let avg = textureSampleLevel(albedo_array, albedo_sampler, vec2<f32>(0.5), layer, top_mip);
-    let variation = mix(vec3<f32>(1.0), far.rgb / max(avg.rgb, vec3<f32>(0.01)), FAR_MIX);
+    let avg = textureSampleLevel(albedo_array, albedo_sampler, vec2<f32>(0.5), layer, top_mip).rgb;
+    let ratio = min(far / max(avg, vec3<f32>(0.01)), vec3<f32>(FAR_MAX_RATIO));
+    let variation = mix(vec3<f32>(1.0), ratio, settings.far_mix);
     return vec4<f32>(clamp(near.rgb * variation, vec3<f32>(0.0), vec3<f32>(1.0)), near.a);
 }
 

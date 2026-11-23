@@ -236,6 +236,8 @@ impl From<&PlumeSplatExtension> for PlumeSplatKey {
 ///     height_blend_sharpness: 0.5, // Enable height blending
 ///     blend_offset: 0.1,          // Sharper material transitions
 ///     blend_exponent: 2.0,        // Squared weights
+///     far_scale: 0.11,            // Far sample ~9x larger
+///     far_mix: 0.6,               // Large-scale variation strength
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, ShaderType)]
@@ -291,6 +293,23 @@ pub struct PlumeSplatSettings {
     /// - **Range**: 1.0 (linear) to 8.0 (very sharp)
     /// - **Example**: 2.0 = quadratic falloff, 3.0 = cubic falloff
     pub blend_exponent: f32,
+
+    /// Scale of the far (large-scale) albedo sample, relative to `uv_scale`.
+    ///
+    /// Multi-scale sampling samples each layer's albedo a second time at this
+    /// smaller scale (so the texture appears larger) and uses it to brighten
+    /// or darken the normal sample. This breaks up visible tiling at distance.
+    ///
+    /// - **Default**: 0.11 (the far texture is ~9x larger)
+    /// - **Range**: 0.01 to 1.0. Avoid simple fractions like 0.5 or 0.25: the two
+    ///   scales then tile in step and the repetition stays visible.
+    pub far_scale: f32,
+
+    /// Strength of the far albedo sample.
+    ///
+    /// - **Default**: 0.6
+    /// - **Range**: 0.0 (off; the far sample is skipped entirely) to 1.0 (full)
+    pub far_mix: f32,
 }
 
 impl Default for PlumeSplatSettings {
@@ -301,7 +320,18 @@ impl Default for PlumeSplatSettings {
             height_blend_sharpness: 0.0,
             blend_offset: 0.0,
             blend_exponent: 1.0,
+            far_scale: 0.11,
+            far_mix: 0.6,
         }
+    }
+}
+
+impl PlumeSplatSettings {
+    /// Sets multi-scale albedo sampling, clamping both values to their ranges.
+    /// Shared by the extension and builder `with_multi_scale` methods.
+    pub(crate) fn set_multi_scale(&mut self, far_scale: f32, mix: f32) {
+        self.far_scale = far_scale.clamp(0.01, 1.0);
+        self.far_mix = mix.clamp(0.0, 1.0);
     }
 }
 
@@ -464,6 +494,31 @@ impl PlumeSplatExtension {
         self.settings.blend_exponent = exponent.clamp(1.0, 8.0);
         self
     }
+
+    /// Configures multi-scale albedo sampling.
+    ///
+    /// Each layer's albedo is sampled a second time at `far_scale` (relative to
+    /// `uv_scale`) and used to modulate the normal sample, breaking up visible
+    /// tiling at distance. Set `mix` to 0.0 to disable it and skip the extra samples.
+    ///
+    /// # Arguments
+    ///
+    /// * `far_scale` - Far sample scale (clamped to 0.01-1.0, default: 0.11)
+    /// * `mix` - Strength (clamped to 0.0-1.0, default: 0.6)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use plumesplat::PlumeSplatExtension;
+    /// # let albedo = bevy::asset::Handle::default();
+    /// // Subtler, larger-scale variation
+    /// let ext = PlumeSplatExtension::new(albedo)
+    ///     .with_multi_scale(0.07, 0.4);
+    /// ```
+    pub fn with_multi_scale(mut self, far_scale: f32, mix: f32) -> Self {
+        self.settings.set_multi_scale(far_scale, mix);
+        self
+    }
 }
 
 impl MaterialExtension for PlumeSplatExtension {
@@ -521,6 +576,23 @@ mod tests {
         assert_eq!(settings.height_blend_sharpness, 0.0);
         assert_eq!(settings.blend_offset, 0.0);
         assert_eq!(settings.blend_exponent, 1.0);
+        assert_eq!(settings.far_scale, 0.11);
+        assert_eq!(settings.far_mix, 0.6);
+    }
+
+    #[test]
+    fn test_multi_scale_clamping() {
+        let ext = PlumeSplatExtension::default().with_multi_scale(0.07, 0.4);
+        assert_eq!(ext.settings.far_scale, 0.07);
+        assert_eq!(ext.settings.far_mix, 0.4);
+
+        let ext = PlumeSplatExtension::default().with_multi_scale(0.0, -1.0);
+        assert_eq!(ext.settings.far_scale, 0.01);
+        assert_eq!(ext.settings.far_mix, 0.0);
+
+        let ext = PlumeSplatExtension::default().with_multi_scale(5.0, 2.0);
+        assert_eq!(ext.settings.far_scale, 1.0);
+        assert_eq!(ext.settings.far_mix, 1.0);
     }
 
     #[test]

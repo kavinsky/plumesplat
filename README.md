@@ -128,6 +128,8 @@ let pending = SplatMaterialBuilder::new()
     .with_blend_offset(0.1)
     // Blend exponent (higher = sharper boundaries)
     .with_blend_exponent(2.0)
+    // Multi-scale albedo: far sample scale and strength (0.0 strength = off)
+    .with_multi_scale(0.11, 0.6)
     // Custom base material settings
     .with_base_material(StandardMaterial {
         perceptual_roughness: 0.8,
@@ -145,6 +147,8 @@ let pending = SplatMaterialBuilder::new()
 | `height_blend_sharpness` | 0.0 | 0.0+ | Height-based blending (0 = disabled) |
 | `blend_offset` | 0.0 | 0.0-0.5 | Subtracts from weights for sharper transitions |
 | `blend_exponent` | 1.0 | 1.0-8.0 | Power applied to weights (higher = sharper) |
+| `far_scale` | 0.11 | 0.01-1.0 | Scale of the large-scale albedo sample, relative to `uv_scale` |
+| `far_mix` | 0.6 | 0.0-1.0 | Strength of the large-scale albedo sample (0 = off, skips it) |
 
 ## Vertex Attributes
 

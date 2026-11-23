@@ -352,6 +352,20 @@ impl SplatMaterialBuilder {
         self
     }
 
+    /// Configures multi-scale albedo sampling.
+    ///
+    /// Each layer's albedo is sampled a second time at `far_scale` (relative to
+    /// the UV scale) and used to modulate the normal sample, breaking up visible
+    /// tiling at distance. Set `mix` to 0.0 to disable it and skip the extra samples.
+    ///
+    /// - **far_scale**: default 0.11, range 0.01 to 1.0
+    /// - **mix**: default 0.6, range 0.0 (off) to 1.0
+    #[must_use]
+    pub fn with_multi_scale(mut self, far_scale: f32, mix: f32) -> Self {
+        self.settings.set_multi_scale(far_scale, mix);
+        self
+    }
+
     /// Sets the base [`StandardMaterial`] properties.
     ///
     /// These properties affect the overall material appearance and are
