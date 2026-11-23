@@ -34,6 +34,9 @@ struct PlumeSplatSettings {
     far_mix: f32,
     // Random per-tile rotation in stochastic tiling: 0 = off, 1 = full turn.
     stochastic_rotation: f32,
+    // Distance-based LOD fade band, world units from the camera. lod_far <= 0 = off.
+    lod_near: f32,
+    lod_far: f32,
 }
 @group(constants::MATERIAL_BIND_GROUP) @binding(102) var<uniform> settings: PlumeSplatSettings;
 
@@ -60,6 +63,10 @@ const FAR_ROT: mat2x2<f32> = mat2x2<f32>(0.7986, 0.6018, -0.6018, 0.7986);
 // Upper bound on the far/average ratio, so layers whose average is very dark in
 // one channel can't blow that channel up.
 const FAR_MAX_RATIO: f32 = 4.0;
+// Distance LOD: triplanar sharpness is multiplied by this at full LOD, capped
+// at the max (the documented upper end of `triplanar_sharpness`).
+const LOD_SHARPNESS_SCALE: f32 = 2.0;
+const LOD_SHARPNESS_MAX: f32 = 16.0;
 
 struct SplatVertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -313,13 +320,28 @@ fn fragment(
         n = -n;
     }
 
+    // Distance LOD: 0 = full detail, 1 = fully reduced. The branch is uniform,
+    // so with LOD off nothing below changes.
+    var lod = 0.0;
+    if settings.lod_far > 0.0 {
+        let d = length(in.world_position.xyz - view.world_position);
+        lod = smoothstep(settings.lod_near, settings.lod_far, d);
+    }
+
     // Derivatives must be taken in uniform control flow, so compute them once here.
     var t: Triplanar;
     t.p = in.world_position.xyz * settings.uv_scale;
     t.dx = dpdx(t.p);
     t.dy = dpdy(t.p);
     t.n = n;
-    let plane_w = pow(abs(n), vec3<f32>(max(settings.triplanar_sharpness, 1.0)));
+    var sharpness = max(settings.triplanar_sharpness, 1.0);
+    if lod > 0.0 {
+        // Sharper plane blending with distance, so fewer planes pass
+        // MIN_PLANE_WEIGHT. Never softer than the user's value.
+        let far_sharpness = max(sharpness, min(sharpness * LOD_SHARPNESS_SCALE, LOD_SHARPNESS_MAX));
+        sharpness = mix(sharpness, far_sharpness, lod);
+    }
+    let plane_w = pow(abs(n), vec3<f32>(sharpness));
     t.w = plane_w / max(dot(plane_w, vec3<f32>(1.0)), 0.0001);
 
     let idx = vec4<i32>(unpack_u8x4(in.material_indices));
@@ -356,8 +378,12 @@ fn fragment(
             continue;
         }
         color += albedo[i] * w[i];
+        // Beyond the LOD fade the normal map is fully replaced by the geometry
+        // normal, so skip sampling it. Legal: all samples use explicit gradients.
         @if(HAS_NORMAL_ARRAY)
-        normal_sum += sample_triplanar_normal(t, idx[i]) * w[i];
+        if lod < 1.0 {
+            normal_sum += sample_triplanar_normal(t, idx[i]) * w[i];
+        }
         @if(HAS_PBR_ARRAY)
         mrao += pbr[i].rgb * w[i];
     }
@@ -374,8 +400,18 @@ fn fragment(
     pbr_input.frag_coord = in.position;
     pbr_input.world_position = in.world_position;
     pbr_input.world_normal = n;
-    @if(HAS_NORMAL_ARRAY)
-    pbr_input.N = normalize(normal_sum);
+    @if(HAS_NORMAL_ARRAY) {
+        // Fade the normal map toward the geometry normal with distance. lod == 0
+        // keeps the exact pre-LOD path; lod == 1 never sampled the normal map.
+        var N = n;
+        if lod < 1.0 {
+            N = normalize(normal_sum);
+            if lod > 0.0 {
+                N = normalize(mix(N, n, lod));
+            }
+        }
+        pbr_input.N = N;
+    }
     @else
     pbr_input.N = n;
     pbr_input.is_orthographic = view.clip_from_view[3].w == 1.0;

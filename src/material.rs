@@ -307,6 +307,8 @@ impl From<&PlumeSplatExtension> for PlumeSplatKey {
 ///     far_scale: 0.11,            // Far sample ~9x larger
 ///     far_mix: 0.6,               // Large-scale variation strength
 ///     stochastic_rotation: 0.0,   // Random tile rotation (off)
+///     lod_near: 0.0,              // Distance LOD fade start
+///     lod_far: 0.0,               // Distance LOD fade end (0 = off)
 /// };
 /// ```
 #[derive(Debug, Clone, Copy, ShaderType)]
@@ -397,6 +399,25 @@ pub struct PlumeSplatSettings {
     /// - **Default**: 0.0 (off)
     /// - **Range**: 0.0 (off) to 1.0 (any angle). 0.5 limits rotation to ±90°.
     pub stochastic_rotation: f32,
+
+    /// Distance (world units, from the camera) where distance-based LOD starts
+    /// to fade in. See [`lod_far`](Self::lod_far).
+    ///
+    /// - **Default**: 0.0
+    pub lod_near: f32,
+
+    /// Distance (world units, from the camera) where distance-based LOD is
+    /// fully applied. Set to 0.0 to turn LOD off.
+    ///
+    /// Between `lod_near` and `lod_far` the effect fades in smoothly, so there
+    /// is no popping. Beyond `lod_far`, normal maps are faded to the geometry
+    /// normal and no longer sampled (cheaper, and less specular shimmer), and
+    /// triplanar blending is sharpened so fewer projection planes are sampled.
+    /// Stochastic tiling stays on at every distance.
+    ///
+    /// - **Default**: 0.0 (off)
+    /// - **Range**: 0.0 (off), or greater than `lod_near`
+    pub lod_far: f32,
 }
 
 impl Default for PlumeSplatSettings {
@@ -410,6 +431,8 @@ impl Default for PlumeSplatSettings {
             far_scale: 0.11,
             far_mix: 0.6,
             stochastic_rotation: 0.0,
+            lod_near: 0.0,
+            lod_far: 0.0,
         }
     }
 }
@@ -420,6 +443,14 @@ impl PlumeSplatSettings {
     pub(crate) fn set_multi_scale(&mut self, far_scale: f32, mix: f32) {
         self.far_scale = far_scale.clamp(0.01, 1.0);
         self.far_mix = mix.clamp(0.0, 1.0);
+    }
+
+    /// Sets distance-based LOD. `near` is clamped to >= 0 and `far` to at least
+    /// `near + 0.01`, so the fade band is never empty. Shared by the extension
+    /// and builder `with_distance_lod` methods.
+    pub(crate) fn set_distance_lod(&mut self, near: f32, far: f32) {
+        self.lod_near = near.max(0.0);
+        self.lod_far = far.max(self.lod_near + 0.01);
     }
 }
 
@@ -656,6 +687,31 @@ impl PlumeSplatExtension {
         self.layer_settings.set_rotation(layer, Some(strength));
         self
     }
+
+    /// Enables distance-based LOD: cheaper shading far from the camera.
+    ///
+    /// Between `near` and `far` (world units from the camera) the effect fades
+    /// in smoothly. Beyond `far`, normal maps fade to the geometry normal and
+    /// are no longer sampled, and triplanar blending is sharpened. Off by default.
+    /// To turn it off again, set [`lod_far`](PlumeSplatSettings::lod_far) to 0.0.
+    ///
+    /// # Arguments
+    ///
+    /// * `near` - Fade start distance (clamped to >= 0.0)
+    /// * `far` - Fade end distance (clamped to at least `near + 0.01`)
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use plumesplat::PlumeSplatExtension;
+    /// # let albedo = bevy::asset::Handle::default();
+    /// let ext = PlumeSplatExtension::new(albedo)
+    ///     .with_distance_lod(40.0, 80.0);
+    /// ```
+    pub fn with_distance_lod(mut self, near: f32, far: f32) -> Self {
+        self.settings.set_distance_lod(near, far);
+        self
+    }
 }
 
 impl MaterialExtension for PlumeSplatExtension {
@@ -716,6 +772,23 @@ mod tests {
         assert_eq!(settings.far_scale, 0.11);
         assert_eq!(settings.far_mix, 0.6);
         assert_eq!(settings.stochastic_rotation, 0.0);
+        assert_eq!(settings.lod_near, 0.0);
+        assert_eq!(settings.lod_far, 0.0); // LOD off
+    }
+
+    #[test]
+    fn test_distance_lod_clamping() {
+        let ext = PlumeSplatExtension::default().with_distance_lod(40.0, 80.0);
+        assert_eq!(ext.settings.lod_near, 40.0);
+        assert_eq!(ext.settings.lod_far, 80.0);
+
+        let ext = PlumeSplatExtension::default().with_distance_lod(-5.0, -1.0);
+        assert_eq!(ext.settings.lod_near, 0.0);
+        assert_eq!(ext.settings.lod_far, 0.01); // never off or empty once set
+
+        let ext = PlumeSplatExtension::default().with_distance_lod(50.0, 20.0);
+        assert_eq!(ext.settings.lod_near, 50.0);
+        assert!(ext.settings.lod_far > 50.0);
     }
 
     #[test]

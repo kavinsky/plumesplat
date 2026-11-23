@@ -269,6 +269,8 @@ plus one sample of the layer's smallest mip level. `far_mix = 0.0` removes all o
   `MaterialVertex`.
 - **Repetition still visible at a distance**: raise `far_mix`, try another
   `far_scale`, and turn on rotation for layers without a direction.
+- **Distant terrain looks flat**: that is distance LOD, not tiling. See
+  [DISTANCE_LOD.md](DISTANCE_LOD.md).
 
 ## Upgrading from older versions
 

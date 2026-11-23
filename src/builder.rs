@@ -417,6 +417,20 @@ impl SplatMaterialBuilder {
         self
     }
 
+    /// Enables distance-based LOD: cheaper shading far from the camera.
+    ///
+    /// Between `near` and `far` (world units from the camera) the effect fades
+    /// in smoothly. Beyond `far`, normal maps fade to the geometry normal and
+    /// are no longer sampled, and triplanar blending is sharpened.
+    ///
+    /// - **Default**: off
+    /// - **near**: clamped to >= 0.0; **far**: clamped to at least `near + 0.01`
+    #[must_use]
+    pub fn with_distance_lod(mut self, near: f32, far: f32) -> Self {
+        self.settings.set_distance_lod(near, far);
+        self
+    }
+
     /// Sets the base [`StandardMaterial`] properties.
     ///
     /// These properties affect the overall material appearance and are
@@ -737,5 +751,20 @@ mod tests {
         assert_eq!(layers.rotation(2), Some(1.0));
         assert_eq!(layers.rotation(3), None); // unused layers inherit too
         assert_eq!(pending.settings.stochastic_rotation, 1.0);
+    }
+
+    #[test]
+    fn test_distance_lod_passes_through() {
+        let pending = SplatMaterialBuilder::new()
+            .add_layer(MaterialLayer::new(Handle::default()))
+            .build();
+        assert_eq!(pending.settings.lod_far, 0.0); // off by default
+
+        let pending = SplatMaterialBuilder::new()
+            .add_layer(MaterialLayer::new(Handle::default()))
+            .with_distance_lod(30.0, 60.0)
+            .build();
+        assert_eq!(pending.settings.lod_near, 30.0);
+        assert_eq!(pending.settings.lod_far, 60.0);
     }
 }

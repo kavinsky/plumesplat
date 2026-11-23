@@ -17,6 +17,7 @@ PlumeSplat is a high-performance terrain material blending library for the [Bevy
 - **Stochastic Tiling** - Eliminates visible texture repetition patterns
 - **Stochastic Rotation** - Optional random tile rotation, global or per layer
 - **Multi-Scale Blending** - Combines multiple texture frequencies to reduce repetition
+- **Distance LOD** - Optional: skips normal maps and sharpens triplanar blending far from the camera, with a smooth fade (~20% faster terrain pass on distant views)
 - **Height-Based Blending** - Natural material transitions based on height maps
 - **Configurable Blend Sharpness** - Control how materials transition at boundaries
 - **Builder API** - Ergonomic API that automatically combines individual textures into arrays
@@ -138,6 +139,9 @@ let pending = SplatMaterialBuilder::new()
     // Random tile rotation (0.0 = off) for every layer without its own
     // with_rotation() override. Best for textures without a direction
     .with_stochastic_rotation(1.0)
+    // Distance LOD (off by default): beyond 80 units, skip normal maps and
+    // sharpen triplanar blending; fades in smoothly from 40 units
+    .with_distance_lod(40.0, 80.0)
     // Custom base material settings
     .with_base_material(StandardMaterial {
         perceptual_roughness: 0.8,
@@ -158,8 +162,10 @@ let pending = SplatMaterialBuilder::new()
 | `far_scale` | 0.11 | 0.01-1.0 | Scale of the large-scale albedo sample, relative to `uv_scale` |
 | `far_mix` | 0.6 | 0.0-1.0 | Strength of the large-scale albedo sample (0 = off, skips it) |
 | `stochastic_rotation` | 0.0 | 0.0-1.0 | Random per-tile rotation (0 = off, 1 = any angle). Global value; layers can override it with `MaterialLayer::with_rotation` |
+| `lod_near` | 0.0 | 0.0+ | Distance (world units from the camera) where distance LOD starts to fade in |
+| `lod_far` | 0.0 | 0.0 or > `lod_near` | Distance where distance LOD is fully applied (0 = off). Beyond it normal maps are skipped and triplanar blending is sharpened |
 
-See [docs/TILING_AND_VARIATION.md](docs/TILING_AND_VARIATION.md) for how stochastic tiling, rotation (global and per layer) and multi-scale sampling work together, with examples and comparison images.
+See [docs/TILING_AND_VARIATION.md](docs/TILING_AND_VARIATION.md) for how stochastic tiling, rotation (global and per layer) and multi-scale sampling work together, and [docs/DISTANCE_LOD.md](docs/DISTANCE_LOD.md) for distance LOD, both with examples and comparison images.
 
 ## Vertex Attributes
 
@@ -230,7 +236,9 @@ fn setup(
         },
         extension: PlumeSplatExtension::new(albedo_array)
             .with_normal_array(normal_array)
-            .with_uv_scale(2.0),
+            .with_uv_scale(2.0)
+            // Optional: cheaper shading beyond 40-80 world units
+            .with_distance_lod(40.0, 80.0),
     };
 
     commands.spawn((
@@ -291,6 +299,25 @@ Instead of traditional UV mapping, PlumeSplat projects textures from three ortho
 ### Stochastic Tiling
 
 To prevent visible repetition patterns, PlumeSplat uses hash-based random offsets when sampling textures. This breaks up the regular grid pattern that would otherwise be visible on large terrains.
+
+### Distance LOD
+
+Off by default. With `with_distance_lod(near, far)`, the shader does less work
+far from the camera: between `near` and `far` (world units) normal maps fade
+smoothly to the geometry normal, and beyond `far` they are not sampled at all.
+Triplanar blending is also sharpened there, so slopes sample fewer projections.
+Colors, stochastic tiling, rotation and multi-scale sampling stay on at every
+distance.
+
+![Distance LOD on the bench terrain](docs/images/distance_lod_overview.jpg)
+
+*Bench terrain with an exaggerated 15–30 unit band so the effect is visible.
+Distant rock loses its normal-map relief and looks slightly flatter; up close
+nothing changes (black in the difference image), and the fade has no visible
+edge. Terrain pass on this view: 2.64 ms → 2.06 ms (RTX 3080, 1080p).* In a real
+scene, put `near` where normal-map detail stops being visible. See
+[docs/DISTANCE_LOD.md](docs/DISTANCE_LOD.md) for
+details and choosing values.
 
 ### Automatic Texture Processing
 

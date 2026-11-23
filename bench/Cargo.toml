@@ -9,6 +9,14 @@ description = "Visual + performance regression harness for plumesplat (not part 
 name = "plumesplat-bench"
 path = "src/main.rs"
 
+[features]
+# Opt-in scene variants for "feature on" captures. Off by default, so refs
+# without the API still build the default scene (see compare-refs.ps1).
+# Distance LOD with a fade band inside the bench views (15..30 units).
+lod = []
+# Distance LOD enabled but beyond every view: must render like LOD off.
+lod-out-of-range = []
+
 [dependencies]
 plumesplat = { path = ".." }
 bevy = { version = "0.20" }

@@ -50,8 +50,13 @@ pub fn setup(
         .with_uv_scale(0.5)
         .with_triplanar_sharpness(4.0)
         .with_blend_offset(0.1)
-        .with_blend_exponent(2.0)
-        .build();
+        .with_blend_exponent(2.0);
+    // Scene variants behind bench features (see bench/Cargo.toml).
+    #[cfg(feature = "lod")]
+    let pending = pending.with_distance_lod(15.0, 30.0);
+    #[cfg(feature = "lod-out-of-range")]
+    let pending = pending.with_distance_lod(1000.0, 2000.0);
+    let pending = pending.build();
 
     commands.spawn((Mesh3d(meshes.add(terrain_mesh())), pending, BenchTerrain));
 
