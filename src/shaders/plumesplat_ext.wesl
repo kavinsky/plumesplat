@@ -68,9 +68,21 @@ fn unpack_u8x4(packed: u32) -> vec4<u32> {
     return (vec4<u32>(packed) >> vec4<u32>(0u, 8u, 16u, 24u)) & vec4<u32>(0xFFu);
 }
 
-fn hash2(p: vec2<f32>) -> vec2<f32> {
-    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3)));
-    return fract(sin(q) * 43758.5453);
+// Random offset in [0, 1)^2 for an integer tile cell. Uses the pcg2d integer
+// hash (Jarzynski & Olano 2020) instead of a sin-based one: `sin` loses
+// precision for large arguments, which made the pattern blocky or repeat far
+// from the origin, and its result differed between GPU vendors.
+fn hash2(cell: vec2<f32>) -> vec2<f32> {
+    var v = bitcast<vec2<u32>>(vec2<i32>(cell));
+    v = v * 1664525u + 1013904223u;
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> vec2<u32>(16u));
+    v.x += v.y * 1664525u;
+    v.y += v.x * 1664525u;
+    v = v ^ (v >> vec2<u32>(16u));
+    // Top 24 bits -> float in [0, 1), exact in f32.
+    return vec2<f32>(v >> vec2<u32>(8u)) * (1.0 / 16777216.0);
 }
 
 // Stochastic tiling: blend the 4 nearest tile centers, each with its own random

@@ -169,8 +169,8 @@ pub struct PlumeSplatExtension {
     /// Normal map texture array.
     ///
     /// Each layer contains tangent-space normal maps for the corresponding
-    /// material index. Normals are blended across materials using reoriented
-    /// normal mapping (RNM) for correct results.
+    /// material index. Each layer is projected with whiteout triplanar blending,
+    /// then the world-space normals are blended by layer weight and renormalized.
     ///
     /// **Optional** - If not provided, geometry normals are used.
     #[texture(103, dimension = "2d_array")]
