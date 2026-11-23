@@ -19,23 +19,25 @@
 //!
 //! # What This Plugin Registers
 //!
-//! - **Embedded Shaders**: All WGSL shader files are embedded into the binary
+//! - **Embedded Shader**: The WESL material shader is embedded into the binary
 //! - **Material Plugin**: Registers [`PlumeSplatMaterial`](crate::PlumeSplatMaterial)
 //! - **Processing System**: Automatically converts [`PendingSplatMaterial`](crate::PendingSplatMaterial)
 //!   into final materials when textures are loaded
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 use bevy::app::{App, Plugin, Update};
-use bevy::log::warn;
-use bevy::asset::{embedded_asset, Assets, Handle, RenderAssetUsages};
+use bevy::asset::{embedded_asset, AssetId, AssetServer, Assets, Handle, RenderAssetUsages};
 use bevy::ecs::entity::Entity;
-use bevy::ecs::system::{Commands, Query, ResMut};
-use bevy::image::{Image, ImageSampler, ImageSamplerDescriptor, ImageAddressMode, ImageFilterMode};
-use bevy::pbr::{MeshMaterial3d, MaterialPlugin};
+use bevy::ecs::system::{Commands, Local, Query, Res, ResMut};
+use bevy::image::{Image, ImageAddressMode, ImageFilterMode, ImageSampler, ImageSamplerDescriptor};
+use bevy::log::{error, warn};
+use bevy::pbr::{MaterialPlugin, MeshMaterial3d};
 use bevy::render::render_resource::{
     Extent3d, TextureDataOrder, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
 };
+use bevy::tasks::{futures::check_ready, AsyncComputeTaskPool, Task};
 
 use crate::builder::PendingSplatMaterial;
 use crate::material::{PlumeSplatExtension, PlumeSplatMaterial};
@@ -45,7 +47,7 @@ use crate::material::{PlumeSplatExtension, PlumeSplatMaterial};
 /// This plugin must be added to your Bevy app to use PlumeSplat materials.
 /// It handles:
 ///
-/// - Embedding and registering WGSL shader files
+/// - Embedding and registering the WESL shader
 /// - Registering the [`PlumeSplatMaterial`](crate::PlumeSplatMaterial) with Bevy's material system
 /// - Processing [`PendingSplatMaterial`](crate::PendingSplatMaterial) components into final materials
 ///
@@ -99,49 +101,73 @@ impl Plugin for PlumeSplatPlugin {
     }
 }
 
+/// The texture handles of every layer: (albedo, normal, pbr) per layer.
+type LayerKey = Vec<(AssetId<Image>, Option<AssetId<Image>>, Option<AssetId<Image>>)>;
+type ArrayIds = (AssetId<Image>, Option<AssetId<Image>>, Option<AssetId<Image>>);
+type ArrayHandles = (Handle<Image>, Option<Handle<Image>>, Option<Handle<Image>>);
+
+/// Texture arrays, shared by every entity that uses the same layer textures.
+///
+/// `ready` only stores ids: the arrays are freed once no material uses them,
+/// and are rebuilt if that layer set shows up again.
+#[derive(Default)]
+struct ArrayCache {
+    building: HashMap<LayerKey, Task<BuiltArrays>>,
+    ready: HashMap<LayerKey, ArrayIds>,
+}
+
+struct BuiltArrays {
+    albedo: Image,
+    normal: Option<Image>,
+    pbr: Option<Image>,
+}
+
 /// System that processes [`PendingSplatMaterial`] components.
 ///
 /// When all textures for a pending material are loaded, this system:
-/// 1. Combines individual textures into texture arrays
+/// 1. Combines individual textures into texture arrays on a background thread
+///    (or reuses the arrays of another entity with the same layer textures)
 /// 2. Creates the final [`PlumeSplatMaterial`]
 /// 3. Removes the [`PendingSplatMaterial`] component
 /// 4. Adds [`MeshMaterial3d<PlumeSplatMaterial>`] to the entity
+///
+/// If a texture fails to load, an error is logged and the pending component is removed.
 fn process_pending_materials(
     mut commands: Commands,
     query: Query<(Entity, &PendingSplatMaterial)>,
+    asset_server: Res<AssetServer>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<PlumeSplatMaterial>>,
+    mut cache: Local<ArrayCache>,
 ) {
-    for (entity, pending) in query.iter() {
-        // Check if all textures are loaded
+    for (entity, pending) in &query {
+        if let Some(handle) = pending.failed_texture(&asset_server) {
+            error!(
+                "plumesplat: texture {:?} failed to load; the splat material for {entity} was not created",
+                handle.path()
+            );
+            commands.entity(entity).remove::<PendingSplatMaterial>();
+            continue;
+        }
         if !pending.is_ready(&images) {
             continue;
         }
-
-        // Combine textures into arrays
-        let (albedo_array, normal_array, pbr_array) =
-            combine_textures_into_arrays(pending, &mut images);
-
-        // Create the extension
-        let mut extension = PlumeSplatExtension::new(albedo_array);
-        extension.settings = pending.settings;
-
-        if let Some(normal) = normal_array {
-            extension.normal_array = Some(normal);
-        }
-        if let Some(pbr) = pbr_array {
-            extension.pbr_array = Some(pbr);
-        }
-
-        // Create the final material
-        let material = PlumeSplatMaterial {
-            base: pending.base_material.clone(),
-            extension,
+        let Some((albedo_array, normal_array, pbr_array)) =
+            shared_arrays(&mut cache, pending, &mut images)
+        else {
+            continue; // still building
         };
 
-        let material_handle = materials.add(material);
+        let mut extension = PlumeSplatExtension::new(albedo_array);
+        extension.settings = pending.settings;
+        extension.normal_array = normal_array;
+        extension.pbr_array = pbr_array;
 
-        // Update the entity: remove pending, add final material
+        let material_handle = materials.add(PlumeSplatMaterial {
+            base: pending.base_material.clone(),
+            extension,
+        });
+
         commands
             .entity(entity)
             .remove::<PendingSplatMaterial>()
@@ -149,115 +175,109 @@ fn process_pending_materials(
     }
 }
 
-/// Combines individual layer textures into texture arrays.
-///
-/// Returns (albedo_array, optional_normal_array, optional_pbr_array).
-fn combine_textures_into_arrays(
+/// Returns the texture arrays for this layer set, starting a background build
+/// the first time. `None` while the build is running.
+fn shared_arrays(
+    cache: &mut ArrayCache,
     pending: &PendingSplatMaterial,
     images: &mut Assets<Image>,
-) -> (Handle<Image>, Option<Handle<Image>>, Option<Handle<Image>>) {
-    // Get dimensions from first albedo texture
+) -> Option<ArrayHandles> {
+    let key: LayerKey = pending
+        .layers
+        .iter()
+        .map(|l| (l.albedo.id(), l.normal.as_ref().map(Handle::id), l.pbr.as_ref().map(Handle::id)))
+        .collect();
+
+    if let Some(handles) = cache.ready.get(&key).and_then(|ids| upgrade(ids, images)) {
+        return Some(handles);
+    }
+
+    let task = cache
+        .building
+        .entry(key.clone())
+        .or_insert_with(|| spawn_build(pending, images));
+    let built = check_ready(task)?;
+    cache.building.remove(&key);
+
+    let handles = (
+        images.add(built.albedo),
+        built.normal.map(|image| images.add(image)),
+        built.pbr.map(|image| images.add(image)),
+    );
+    let ids = (
+        handles.0.id(),
+        handles.1.as_ref().map(Handle::id),
+        handles.2.as_ref().map(Handle::id),
+    );
+    cache.ready.insert(key, ids);
+    Some(handles)
+}
+
+/// Strong handles for cached arrays, or `None` if any of them was already freed.
+fn upgrade(ids: &ArrayIds, images: &mut Assets<Image>) -> Option<ArrayHandles> {
+    let albedo = images.get_strong_handle(ids.0)?;
+    let normal = match ids.1 {
+        Some(id) => Some(images.get_strong_handle(id)?),
+        None => None,
+    };
+    let pbr = match ids.2 {
+        Some(id) => Some(images.get_strong_handle(id)?),
+        None => None,
+    };
+    Some((albedo, normal, pbr))
+}
+
+/// Copies the layer pixels and builds the arrays (mipmaps included) on the
+/// async compute pool, so loading does not stall a frame.
+fn spawn_build(pending: &PendingSplatMaterial, images: &Assets<Image>) -> Task<BuiltArrays> {
     let first_albedo = images.get(&pending.layers[0].albedo).unwrap();
     let size = (
         first_albedo.texture_descriptor.size.width,
         first_albedo.texture_descriptor.size.height,
     );
 
-    // Albedo is color data (sRGB). Normal and PBR are raw data and must stay linear.
-    let albedo_array = create_texture_array(
-        pending.layers.iter().map(|l| Some(&l.albedo)),
-        size,
-        [255, 255, 255, 255], // unused: every layer has an albedo
-        TextureFormat::Rgba8UnormSrgb,
-        images,
-    );
+    let albedo = layer_pixels(pending.layers.iter().map(|l| Some(&l.albedo)), size, images);
+    let normal = pending
+        .has_normals()
+        .then(|| layer_pixels(pending.layers.iter().map(|l| l.normal.as_ref()), size, images));
+    let pbr = pending
+        .has_pbr()
+        .then(|| layer_pixels(pending.layers.iter().map(|l| l.pbr.as_ref()), size, images));
 
-    let normal_array = pending.has_normals().then(|| {
-        create_texture_array(
-            pending.layers.iter().map(|l| l.normal.as_ref()),
-            size,
-            [128, 128, 255, 255], // flat normal
-            TextureFormat::Rgba8Unorm,
-            images,
-        )
-    });
-
-    let pbr_array = pending.has_pbr().then(|| {
-        create_texture_array(
-            pending.layers.iter().map(|l| l.pbr.as_ref()),
-            size,
-            [0, 128, 255, 128], // metallic=0, roughness=0.5, ao=1.0, height=0.5
-            TextureFormat::Rgba8Unorm,
-            images,
-        )
-    });
-
-    (albedo_array, normal_array, pbr_array)
+    AsyncComputeTaskPool::get().spawn(async move {
+        BuiltArrays {
+            albedo: build_array(albedo, size, [255, 255, 255, 255], ArrayKind::Color),
+            normal: normal.map(|layers| build_array(layers, size, [128, 128, 255, 255], ArrayKind::Normal)),
+            // metallic=0, roughness=0.5, ao=1.0, height=0.5
+            pbr: pbr.map(|layers| build_array(layers, size, [0, 128, 255, 128], ArrayKind::Data)),
+        }
+    })
 }
 
-/// Creates a mipmapped texture array, one layer per handle.
-///
-/// Layers without a texture (`None`) are filled with `default_color`.
-fn create_texture_array<'a>(
+/// RGBA8 pixels of each layer. `None` for a missing texture, or one that can't
+/// be used (a warning is logged); the array fills those with a default color.
+fn layer_pixels<'a>(
     layers: impl Iterator<Item = Option<&'a Handle<Image>>>,
-    (width, height): (u32, u32),
-    default_color: [u8; 4],
-    format: TextureFormat,
-    images: &mut Assets<Image>,
-) -> Handle<Image> {
-    let mip_count = calculate_mip_count(width, height);
-    let default_data = default_color.repeat((width * height) as usize);
-
-    let mut array_data = Vec::new();
-    let mut num_layers = 0;
-    for layer in layers {
-        let data = match layer {
-            None => Cow::Borrowed(default_data.as_slice()),
-            Some(handle) => rgba8_bytes(images.get(handle).unwrap(), (width, height))
-                .unwrap_or_else(|| {
-                    warn!(
-                        "plumesplat: layer {num_layers} texture {:?} must be {width}x{height}, \
-                         8- or 16-bit RGBA, with CPU-side data; using a default color instead",
-                        handle.path()
-                    );
-                    Cow::Borrowed(default_data.as_slice())
-                }),
-        };
-        array_data.extend(generate_mipmaps(&data, width, height, mip_count));
-        num_layers += 1;
-    }
-
-    images.add(Image {
-        data: Some(array_data),
-        texture_descriptor: TextureDescriptor {
-            label: Some("splat_texture_array"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: num_layers,
-            },
-            mip_level_count: mip_count,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format,
-            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
-            address_mode_u: ImageAddressMode::Repeat,
-            address_mode_v: ImageAddressMode::Repeat,
-            address_mode_w: ImageAddressMode::ClampToEdge,
-            mag_filter: ImageFilterMode::Linear,
-            min_filter: ImageFilterMode::Linear,
-            mipmap_filter: ImageFilterMode::Linear,
-            anisotropy_clamp: 16,
-            ..Default::default()
-        }),
-        texture_view_descriptor: None,
-        asset_usage: RenderAssetUsages::RENDER_WORLD,
-        data_order: TextureDataOrder::LayerMajor,
-        copy_on_resize: false,
-    })
+    size: (u32, u32),
+    images: &Assets<Image>,
+) -> Vec<Option<Vec<u8>>> {
+    layers
+        .enumerate()
+        .map(|(index, layer)| {
+            let handle = layer?;
+            let pixels = rgba8_bytes(images.get(handle)?, size);
+            if pixels.is_none() {
+                warn!(
+                    "plumesplat: layer {index} texture {:?} must be {}x{}, 8- or 16-bit RGBA, \
+                     with CPU-side data; using a default color instead",
+                    handle.path(),
+                    size.0,
+                    size.1
+                );
+            }
+            pixels.map(Cow::into_owned)
+        })
+        .collect()
 }
 
 /// Returns the image as RGBA8 bytes. Bevy loads 8-bit PNGs (also grayscale) as
@@ -280,83 +300,158 @@ fn rgba8_bytes(image: &Image, (width, height): (u32, u32)) -> Option<Cow<'_, [u8
     }
 }
 
+/// How an array's texels are stored and filtered into mipmaps.
+#[derive(Clone, Copy)]
+enum ArrayKind {
+    /// sRGB color: mips are averaged in linear space.
+    Color,
+    /// Tangent-space normals: mips are renormalized.
+    Normal,
+    /// Linear data (metallic, roughness, AO, height).
+    Data,
+}
+
+impl ArrayKind {
+    fn format(self) -> TextureFormat {
+        match self {
+            ArrayKind::Color => TextureFormat::Rgba8UnormSrgb,
+            ArrayKind::Normal | ArrayKind::Data => TextureFormat::Rgba8Unorm,
+        }
+    }
+}
+
+/// Creates a mipmapped texture array, one layer per entry. `None` layers are
+/// filled with `default_color`.
+fn build_array(
+    layers: Vec<Option<Vec<u8>>>,
+    (width, height): (u32, u32),
+    default_color: [u8; 4],
+    kind: ArrayKind,
+) -> Image {
+    let mip_count = calculate_mip_count(width, height);
+    let default_data = default_color.repeat((width * height) as usize);
+
+    let mut array_data = Vec::new();
+    for layer in &layers {
+        let data = layer.as_deref().unwrap_or(&default_data);
+        array_data.extend(generate_mipmaps(data, width, height, mip_count, kind));
+    }
+
+    Image {
+        data: Some(array_data),
+        texture_descriptor: TextureDescriptor {
+            label: Some("splat_texture_array"),
+            size: Extent3d {
+                width,
+                height,
+                depth_or_array_layers: layers.len() as u32,
+            },
+            mip_level_count: mip_count,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: kind.format(),
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
+            address_mode_u: ImageAddressMode::Repeat,
+            address_mode_v: ImageAddressMode::Repeat,
+            address_mode_w: ImageAddressMode::ClampToEdge,
+            mag_filter: ImageFilterMode::Linear,
+            min_filter: ImageFilterMode::Linear,
+            mipmap_filter: ImageFilterMode::Linear,
+            anisotropy_clamp: 16,
+            ..Default::default()
+        }),
+        texture_view_descriptor: None,
+        asset_usage: RenderAssetUsages::RENDER_WORLD,
+        data_order: TextureDataOrder::LayerMajor,
+        copy_on_resize: false,
+    }
+}
+
 /// Calculates the number of mip levels for a texture.
 fn calculate_mip_count(width: u32, height: u32) -> u32 {
     (width.min(height) as f32).log2().floor() as u32 + 1
 }
 
-/// Generates mipmaps for a single texture layer.
-fn generate_mipmaps(data: &[u8], width: u32, height: u32, mip_count: u32) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut current_data = data.to_vec();
-    let mut current_width = width;
-    let mut current_height = height;
-
-    for mip in 0..mip_count {
-        result.extend_from_slice(&current_data);
-
-        if mip < mip_count - 1 {
-            let next_width = (current_width / 2).max(1);
-            let next_height = (current_height / 2).max(1);
-            current_data = downsample_rgba(
-                &current_data,
-                current_width,
-                current_height,
-                next_width,
-                next_height,
-            );
-            current_width = next_width;
-            current_height = next_height;
+/// Returns `data` followed by `mip_count - 1` downsampled levels.
+///
+/// Filtering happens in float: sRGB color is averaged in linear space and
+/// normals are renormalized, so distant terrain keeps its brightness and relief.
+fn generate_mipmaps(data: &[u8], width: u32, height: u32, mip_count: u32, kind: ArrayKind) -> Vec<u8> {
+    let srgb_to_linear: [f32; 256] = std::array::from_fn(|i| {
+        let c = i as f32 / 255.0;
+        if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+    });
+    let decode = |p: &[u8; 4]| -> [f32; 4] {
+        match kind {
+            ArrayKind::Color => [
+                srgb_to_linear[p[0] as usize],
+                srgb_to_linear[p[1] as usize],
+                srgb_to_linear[p[2] as usize],
+                p[3] as f32 / 255.0,
+            ],
+            ArrayKind::Normal | ArrayKind::Data => p.map(|c| c as f32 / 255.0),
         }
-    }
+    };
+    let encode = |p: &[f32; 4]| -> [u8; 4] {
+        let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        match kind {
+            ArrayKind::Color => {
+                let to_srgb = |c: f32| {
+                    if c <= 0.003_130_8 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+                };
+                [to_u8(to_srgb(p[0])), to_u8(to_srgb(p[1])), to_u8(to_srgb(p[2])), to_u8(p[3])]
+            }
+            ArrayKind::Normal | ArrayKind::Data => p.map(to_u8),
+        }
+    };
 
+    let mut result = data.to_vec();
+    let mut level: Vec<[f32; 4]> = data.as_chunks::<4>().0.iter().map(decode).collect();
+    let (mut w, mut h) = (width, height);
+    for _ in 1..mip_count {
+        let (next_w, next_h) = ((w / 2).max(1), (h / 2).max(1));
+        level = downsample(&level, w, h, next_w, next_h);
+        if let ArrayKind::Normal = kind {
+            level.iter_mut().for_each(renormalize);
+        }
+        result.extend(level.iter().flat_map(encode));
+        (w, h) = (next_w, next_h);
+    }
     result
 }
 
-/// Downsamples an RGBA image using box filtering.
-fn downsample_rgba(
-    src: &[u8],
-    src_width: u32,
-    src_height: u32,
-    dst_width: u32,
-    dst_height: u32,
-) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_width * dst_height * 4) as usize];
-
-    for dy in 0..dst_height {
-        for dx in 0..dst_width {
-            let sx = dx * 2;
-            let sy = dy * 2;
-
-            let mut r = 0u32;
-            let mut g = 0u32;
-            let mut b = 0u32;
-            let mut a = 0u32;
-            let mut count = 0u32;
-
-            for oy in 0..2 {
-                for ox in 0..2 {
-                    let px = (sx + ox).min(src_width - 1);
-                    let py = (sy + oy).min(src_height - 1);
-                    let idx = ((py * src_width + px) * 4) as usize;
-
-                    r += src[idx] as u32;
-                    g += src[idx + 1] as u32;
-                    b += src[idx + 2] as u32;
-                    a += src[idx + 3] as u32;
-                    count += 1;
+/// 2x2 box filter; edge texels are repeated for odd sizes.
+fn downsample(src: &[[f32; 4]], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<[f32; 4]> {
+    let mut dst = Vec::with_capacity((dst_w * dst_h) as usize);
+    for dy in 0..dst_h {
+        for dx in 0..dst_w {
+            let mut sum = [0.0f32; 4];
+            for (ox, oy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                let x = (dx * 2 + ox).min(src_w - 1);
+                let y = (dy * 2 + oy).min(src_h - 1);
+                let texel = src[(y * src_w + x) as usize];
+                for c in 0..4 {
+                    sum[c] += texel[c];
                 }
             }
-
-            let dst_idx = ((dy * dst_width + dx) * 4) as usize;
-            dst[dst_idx] = (r / count) as u8;
-            dst[dst_idx + 1] = (g / count) as u8;
-            dst[dst_idx + 2] = (b / count) as u8;
-            dst[dst_idx + 3] = (a / count) as u8;
+            dst.push(sum.map(|c| c * 0.25));
         }
     }
-
     dst
+}
+
+/// Renormalizes an encoded normal (rgb in 0..1) to unit length.
+fn renormalize(texel: &mut [f32; 4]) {
+    let v = [texel[0] * 2.0 - 1.0, texel[1] * 2.0 - 1.0, texel[2] * 2.0 - 1.0];
+    let len = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    if len > 1e-6 {
+        for c in 0..3 {
+            texel[c] = (v[c] / len + 1.0) * 0.5;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -392,5 +487,41 @@ mod tests {
         assert!(rgba8_bytes(&img, (2, 2)).is_none());
         let img = image(TextureFormat::R8Unorm, vec![0]);
         assert!(rgba8_bytes(&img, (1, 1)).is_none());
+    }
+
+    #[test]
+    fn mip_chain_sizes() {
+        // (width, height, expected texel count over all levels)
+        for (w, h, texels) in [(4, 4, 16 + 4 + 1), (3, 5, 15 + 2), (1, 1, 1), (8, 2, 16 + 4)] {
+            let mips = calculate_mip_count(w, h);
+            let data = vec![0u8; (w * h * 4) as usize];
+            let out = generate_mipmaps(&data, w, h, mips, ArrayKind::Data);
+            assert_eq!(out.len(), texels * 4, "{w}x{h}");
+        }
+    }
+
+    #[test]
+    fn data_mips_average_linearly() {
+        let data = [[0, 0, 0, 0], [255, 255, 255, 255], [0, 0, 0, 0], [255, 255, 255, 255]].concat();
+        let out = generate_mipmaps(&data, 2, 2, 2, ArrayKind::Data);
+        assert_eq!(&out[16..], &[128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn color_mips_average_in_linear_space() {
+        // Half black, half white is 0.5 linear, which is 188 in sRGB (not 128).
+        let data = [[0, 0, 0, 255], [255, 255, 255, 255], [0, 0, 0, 255], [255, 255, 255, 255]].concat();
+        let out = generate_mipmaps(&data, 2, 2, 2, ArrayKind::Color);
+        assert_eq!(&out[16..], &[188, 188, 188, 255]);
+    }
+
+    #[test]
+    fn normal_mips_are_renormalized() {
+        // (+0.6, 0, 0.8) and (-0.6, 0, 0.8) average to (0, 0, 0.8): must come back as (0, 0, 1).
+        let n = |x: f32, z: f32| [((x + 1.0) * 127.5).round() as u8, 128, ((z + 1.0) * 127.5).round() as u8, 255];
+        let data = [n(0.6, 0.8), n(-0.6, 0.8), n(0.6, 0.8), n(-0.6, 0.8)].concat();
+        let out = generate_mipmaps(&data, 2, 2, 2, ArrayKind::Normal);
+        assert_eq!(out[16 + 2], 255, "z should be 1.0 after renormalizing");
+        assert!((out[16] as i32 - 128).abs() <= 1, "x should be ~0");
     }
 }

@@ -44,7 +44,7 @@
 
 use bevy::asset::{Asset, Handle};
 use bevy::image::Image;
-use bevy::mesh::MeshVertexBufferLayoutRef;
+use bevy::mesh::{Mesh, MeshVertexBufferLayoutRef};
 use bevy::pbr::{
     ExtendedMaterial, MaterialExtension, MaterialExtensionKey, MaterialExtensionPipeline,
     StandardMaterial,
@@ -52,7 +52,6 @@ use bevy::pbr::{
 use bevy::reflect::TypePath;
 use bevy::render::render_resource::{
     AsBindGroup, RenderPipelineDescriptor, ShaderType, SpecializedMeshPipelineError,
-    VertexAttribute, VertexFormat,
 };
 use bevy::shader::ShaderRef;
 
@@ -92,8 +91,36 @@ pub type PlumeSplatMaterial = ExtendedMaterial<StandardMaterial, PlumeSplatExten
 ///
 /// # Texture Array Format
 ///
-/// All texture arrays should be provided as vertically stacked 2D images that get
-/// converted to GPU texture arrays at runtime. Each layer corresponds to one material:
+/// Each handle must point to a 2D **array** image, one layer per material. The
+/// [`SplatMaterialBuilder`](crate::SplatMaterialBuilder) builds these for you. To load a
+/// vertically stacked PNG yourself, tell the loader to split it into layers (and to keep
+/// normal / PBR data linear):
+///
+/// ```rust,no_run
+/// use bevy::image::{ImageArrayLayout, ImageLoaderSettings};
+/// use bevy::prelude::*;
+///
+/// fn load(asset_server: Res<AssetServer>) {
+///     let albedo: Handle<Image> = asset_server
+///         .load_builder()
+///         .with_settings(|s: &mut ImageLoaderSettings| {
+///             s.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
+///         })
+///         .load("terrain_albedo_array.png");
+///     let normals: Handle<Image> = asset_server
+///         .load_builder()
+///         .with_settings(|s: &mut ImageLoaderSettings| {
+///             s.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
+///             s.is_srgb = false;
+///         })
+///         .load("terrain_normal_array.png");
+/// }
+/// ```
+///
+/// Images loaded this way have no mipmaps, so distant terrain will shimmer; prefer the
+/// builder unless the arrays come with their own mips (e.g. KTX2).
+///
+/// Channel layout:
 ///
 /// | Texture | Channel Layout | Description |
 /// |---------|----------------|-------------|
@@ -283,7 +310,7 @@ impl PlumeSplatExtension {
     ///
     /// # Arguments
     ///
-    /// * `albedo_array` - Handle to the albedo texture array (vertically stacked layers)
+    /// * `albedo_array` - Handle to the albedo 2D array image (see "Texture Array Format" above)
     ///
     /// # Example
     ///
@@ -465,46 +492,18 @@ impl MaterialExtension for PlumeSplatExtension {
             }
         }
 
-        // Register custom vertex attributes for material indices and weights
-        // These are used by the shader to determine which materials to sample
-        // and how to blend them at each vertex
-
-        // Material indices: 4 u8 values packed into a single u32
-        // Shader location 10 is used to avoid conflicts with Bevy's built-in attributes
-        if let Some(index) = layout
-            .0
-            .attribute_ids()
-            .iter()
-            .position(|id| *id == ATTRIBUTE_MATERIAL_INDICES.id)
-        {
-            let attr = &layout.0.layout().attributes[index];
-            descriptor.vertex.buffers[0]
-                .attributes
-                .push(VertexAttribute {
-                    format: VertexFormat::Uint32,
-                    offset: attr.offset,
-                    shader_location: 10,
-                });
-        }
-
-        // Material weights: 4 u8 values (0-255) packed into a single u32
-        // Normalized to 0.0-1.0 in the shader
-        // Shader location 11 for blend weights
-        if let Some(index) = layout
-            .0
-            .attribute_ids()
-            .iter()
-            .position(|id| *id == ATTRIBUTE_MATERIAL_WEIGHTS.id)
-        {
-            let attr = &layout.0.layout().attributes[index];
-            descriptor.vertex.buffers[0]
-                .attributes
-                .push(VertexAttribute {
-                    format: VertexFormat::Uint32,
-                    offset: attr.offset,
-                    shader_location: 11,
-                });
-        }
+        // Add the splat attributes (u32 each, 4 packed u8 values) to Bevy's mesh
+        // vertex buffer at locations 10/11, clear of Bevy's built-in locations.
+        // `get_layout` returns a clear "Mesh is missing requested attribute"
+        // error for meshes without them (or without normals, which the shader needs).
+        let splat = layout.0.get_layout(&[
+            Mesh::ATTRIBUTE_NORMAL.at_shader_location(1),
+            ATTRIBUTE_MATERIAL_INDICES.at_shader_location(10),
+            ATTRIBUTE_MATERIAL_WEIGHTS.at_shader_location(11),
+        ])?;
+        descriptor.vertex.buffers[0]
+            .attributes
+            .extend(splat.attributes.into_iter().filter(|a| a.shader_location >= 10));
 
         Ok(())
     }

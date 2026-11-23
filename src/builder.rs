@@ -61,8 +61,20 @@
 //!    - Creates the final [`PlumeSplatMaterial`]
 //!    - Replaces [`PendingSplatMaterial`] with [`MeshMaterial3d<PlumeSplatMaterial>`]
 //! 4. Your mesh renders with the combined material
+//!
+//! Entities whose layers use the same textures share the same texture arrays,
+//! so splitting a terrain into chunks does not duplicate them. The arrays are
+//! built on a background thread.
+//!
+//! # Texture requirements
+//!
+//! - Every texture must have the same size as the first layer's albedo.
+//! - 8-bit and 16-bit PNGs (RGB, RGBA or grayscale) are supported.
+//! - A texture that doesn't meet this is replaced by a default color and a
+//!   warning is logged. If a texture fails to load, an error is logged and the
+//!   pending material is dropped.
 
-use bevy::asset::Handle;
+use bevy::asset::{AssetServer, Handle};
 use bevy::ecs::component::Component;
 use bevy::image::Image;
 use bevy::pbr::StandardMaterial;
@@ -482,6 +494,14 @@ impl PendingSplatMaterial {
             .iter()
             .flat_map(MaterialLayer::all_handles)
             .all(|handle| images.contains(handle.id()))
+    }
+
+    /// Returns the first texture that failed to load, if any.
+    pub(crate) fn failed_texture(&self, asset_server: &AssetServer) -> Option<&Handle<Image>> {
+        self.layers
+            .iter()
+            .flat_map(MaterialLayer::all_handles)
+            .find(|handle| asset_server.load_state(handle.id()).is_failed())
     }
 
     /// Returns the total number of texture handles that need to load.

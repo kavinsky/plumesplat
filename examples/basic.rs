@@ -6,7 +6,6 @@
 use bevy::asset::RenderAssetUsages;
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
-use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use plumesplat::prelude::*;
 
 fn main() {
@@ -14,61 +13,8 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .add_plugins(PlumeSplatPlugin)
         .add_systems(Startup, setup)
-        .add_systems(Update, (rotate_camera, auto_screenshot))
+        .add_systems(Update, rotate_camera)
         .run();
-}
-
-/// Resource to track screenshot timing
-#[derive(Resource)]
-struct ScreenshotTimer {
-    timer: Timer,
-    taken: bool,
-    frames_after_screenshot: u32,
-}
-
-impl Default for ScreenshotTimer {
-    fn default() -> Self {
-        Self {
-            timer: Timer::from_seconds(3.0, TimerMode::Once),
-            taken: false,
-            frames_after_screenshot: 0,
-        }
-    }
-}
-
-/// Automatically take a screenshot after a delay and exit
-fn auto_screenshot(
-    mut commands: Commands,
-    time: Res<Time>,
-    mut screenshot_timer: Option<ResMut<ScreenshotTimer>>,
-) {
-    // Initialize the timer resource if it doesn't exist
-    if screenshot_timer.is_none() {
-        commands.insert_resource(ScreenshotTimer::default());
-        return;
-    }
-
-    let timer = screenshot_timer.as_mut().unwrap();
-    timer.timer.tick(time.delta());
-
-    if timer.timer.is_finished() && !timer.taken {
-        timer.taken = true;
-        let path = "./screenshot.png";
-        info!("Taking screenshot: {}", path);
-        commands
-            .spawn(Screenshot::primary_window())
-            .observe(save_to_disk(path.to_string()));
-    }
-
-    // Count frames after screenshot and exit after enough time for save
-    if timer.taken {
-        timer.frames_after_screenshot += 1;
-        // Wait ~30 frames (~0.5s at 60fps) to ensure screenshot is saved
-        if timer.frames_after_screenshot > 30 {
-            info!("Screenshot saved, exiting...");
-            std::process::exit(0);
-        }
-    }
 }
 
 fn setup(

@@ -171,11 +171,21 @@ mesh.insert_attribute(ATTRIBUTE_MATERIAL_INDICES, indices);
 mesh.insert_attribute(ATTRIBUTE_MATERIAL_WEIGHTS, weights);
 ```
 
+Meshes also need normals (`Mesh::ATTRIBUTE_NORMAL`); UVs are not used.
+
+> **All vertices of a triangle must use the same 4 material indices, in the same order.**
+> Indices are not interpolated: the GPU takes them from one vertex of each triangle, and
+> only the weights blend across it. If one vertex uses `blend2(0, 1, …)` and its
+> neighbour uses `single(2)`, material 2 disappears from that triangle. A simple way to
+> follow the rule is to give every vertex the same set of indices (for example
+> `[0, 1, 2, 3]`) and only vary the weights, as the example does.
+
 ## Advanced: Direct Material Creation
 
-For advanced use cases, you can bypass the builder and create materials directly with pre-combined texture arrays:
+For advanced use cases, you can bypass the builder and create materials directly with pre-combined texture arrays. The images must be loaded as **array** textures: tell the loader how many layers the stacked image holds, and keep normal maps linear:
 
 ```rust
+use bevy::image::{ImageArrayLayout, ImageLoaderSettings};
 use plumesplat::prelude::*;
 
 fn setup(
@@ -183,9 +193,20 @@ fn setup(
     mut materials: ResMut<Assets<PlumeSplatMaterial>>,
     asset_server: Res<AssetServer>,
 ) {
-    // Load pre-stacked texture arrays (layers stacked vertically)
-    let albedo_array = asset_server.load("terrain_albedo_array.png");
-    let normal_array = asset_server.load("terrain_normal_array.png");
+    // 4 layers stacked vertically in one PNG
+    let albedo_array = asset_server
+        .load_builder()
+        .with_settings(|s: &mut ImageLoaderSettings| {
+            s.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
+        })
+        .load("terrain_albedo_array.png");
+    let normal_array = asset_server
+        .load_builder()
+        .with_settings(|s: &mut ImageLoaderSettings| {
+            s.array_layout = Some(ImageArrayLayout::RowCount { rows: 4 });
+            s.is_srgb = false;
+        })
+        .load("terrain_normal_array.png");
 
     let material = PlumeSplatMaterial {
         base: StandardMaterial {
@@ -220,6 +241,8 @@ When using direct creation, textures must be pre-stacked vertically:
 +------------------+
         = 512x2048 total
 ```
+
+Images loaded this way have no mipmaps, so distant terrain will shimmer. Prefer the builder API, which generates mipmaps, unless your arrays ship with their own (for example KTX2).
 
 ## Example
 
@@ -259,8 +282,15 @@ To prevent visible repetition patterns, PlumeSplat uses hash-based random offset
 When using the builder API, the plugin:
 1. Monitors for entities with `PendingSplatMaterial` components
 2. Waits for all referenced textures to finish loading
-3. Combines them into texture arrays with proper mipmaps and anisotropic filtering
+3. Combines them into texture arrays with mipmaps and anisotropic filtering, on a background thread
 4. Creates the final material and attaches it to the entity
+
+Entities whose layers use the same textures (for example terrain chunks) share one set of texture arrays.
+
+Requirements and failure handling:
+- Every texture must be the same size as the first layer's albedo. 8-bit and 16-bit PNGs (RGB, RGBA or grayscale) are supported.
+- A texture that doesn't meet this is replaced by a default color, with a warning in the log.
+- If a texture fails to load, an error is logged and the pending material is dropped.
 
 ## Compatibility
 

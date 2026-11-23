@@ -126,6 +126,14 @@ pub const ATTRIBUTE_MATERIAL_WEIGHTS: MeshVertexAttribute =
 /// Weights are stored as `u8` values (0-255) and normalized to 0.0-1.0 in the shader.
 /// The constructors automatically ensure weights sum to 255 for correct blending.
 ///
+/// # Same Indices Per Triangle
+///
+/// All three vertices of a triangle must use the same 4 indices, in the same order.
+/// Indices are not interpolated (the GPU takes them from one vertex of the triangle),
+/// only the weights are. Mixing `blend2(0, 1, ..)` and `single(2)` in one triangle
+/// makes material 2 disappear there. The simplest way to follow this rule is to give
+/// every vertex the same index set and vary only the weights, e.g. with [`blend4`](Self::blend4).
+///
 /// # Example
 ///
 /// ```rust
