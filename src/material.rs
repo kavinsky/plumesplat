@@ -127,6 +127,7 @@ pub type PlumeSplatMaterial = ExtendedMaterial<StandardMaterial, PlumeSplatExten
 /// }
 /// ```
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone, Default)]
+#[bind_group_data(PlumeSplatKey)]
 pub struct PlumeSplatExtension {
     /// Albedo (base color) texture array.
     ///
@@ -160,7 +161,8 @@ pub struct PlumeSplatExtension {
     /// | B | Ambient Occlusion | 0.0-1.0 | 0 = fully occluded, 1 = no occlusion |
     /// | A | Height | 0.0-1.0 | Used for height-based blending |
     ///
-    /// **Optional** - If not provided, default PBR values from StandardMaterial are used.
+    /// **Optional** - If not provided, metallic and roughness come from the base
+    /// `StandardMaterial`, and height blending uses albedo alpha.
     #[texture(105, dimension = "2d_array")]
     #[sampler(106, sampler_type = "filtering")]
     pub pbr_array: Option<Handle<Image>>,
@@ -171,6 +173,24 @@ pub struct PlumeSplatExtension {
     /// See [`PlumeSplatSettings`] for details on each setting.
     #[uniform(102)]
     pub settings: PlumeSplatSettings,
+}
+
+/// Pipeline key: which optional arrays are bound, so the shader skips the missing ones.
+#[doc(hidden)]
+#[repr(C)]
+#[derive(Debug, Eq, PartialEq, Hash, Copy, Clone)]
+pub struct PlumeSplatKey {
+    has_normal_array: bool,
+    has_pbr_array: bool,
+}
+
+impl From<&PlumeSplatExtension> for PlumeSplatKey {
+    fn from(ext: &PlumeSplatExtension) -> Self {
+        Self {
+            has_normal_array: ext.normal_array.is_some(),
+            has_pbr_array: ext.pbr_array.is_some(),
+        }
+    }
 }
 
 /// Shader uniform settings for PlumeSplat rendering.
@@ -421,19 +441,30 @@ impl PlumeSplatExtension {
 
 impl MaterialExtension for PlumeSplatExtension {
     fn vertex_shader() -> ShaderRef {
-        "embedded://plumesplat/shaders/plumesplat_ext.wgsl".into()
+        "embedded://plumesplat/shaders/plumesplat_ext.wesl".into()
     }
 
     fn fragment_shader() -> ShaderRef {
-        "embedded://plumesplat/shaders/plumesplat_ext.wgsl".into()
+        "embedded://plumesplat/shaders/plumesplat_ext.wesl".into()
     }
 
     fn specialize(
         _pipeline: &MaterialExtensionPipeline,
         descriptor: &mut RenderPipelineDescriptor,
         layout: &MeshVertexBufferLayoutRef,
-        _key: MaterialExtensionKey<Self>,
+        key: MaterialExtensionKey<Self>,
     ) -> Result<(), SpecializedMeshPipelineError> {
+        // Missing optional arrays are bound to a white fallback image, so the
+        // shader must not sample them.
+        if let Some(fragment) = descriptor.fragment.as_mut() {
+            if key.bind_group_data.has_normal_array {
+                fragment.shader_defs.push("HAS_NORMAL_ARRAY".into());
+            }
+            if key.bind_group_data.has_pbr_array {
+                fragment.shader_defs.push("HAS_PBR_ARRAY".into());
+            }
+        }
+
         // Register custom vertex attributes for material indices and weights
         // These are used by the shader to determine which materials to sample
         // and how to blend them at each vertex

@@ -14,7 +14,7 @@ default = []
 height_blending = []
 
 [dependencies]
-bevy = { version = "0.18", default-features = false, features = [
+bevy = { version = "0.20", default-features = false, features = [
     "bevy_asset",
     "bevy_render",
     "bevy_pbr",
@@ -24,7 +24,7 @@ bevy = { version = "0.18", default-features = false, features = [
 image = { version = "0.25", optional = true }
 
 [dev-dependencies]
-bevy = { version = "0.18", features = ["bevy_winit", "x11"] }
+bevy = { version = "0.20", features = ["bevy_winit", "x11"] }
 
 [[example]]
 name = "basic"

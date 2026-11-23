@@ -121,8 +121,9 @@ fn setup(
     // Spawn directional light (sun)
     commands.spawn((
         DirectionalLight {
-            illuminance: 15000.0,
-            shadows_enabled: true,
+            // Tuned for Bevy's default camera exposure; brighter values clip to white.
+            illuminance: 5000.0,
+            shadow_maps_enabled: true,
             ..default()
         },
         Transform::from_rotation(Quat::from_euler(EulerRot::XYZ, -0.6, 0.4, 0.0)),

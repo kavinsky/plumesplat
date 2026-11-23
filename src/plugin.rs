@@ -24,13 +24,18 @@
 //! - **Processing System**: Automatically converts [`PendingSplatMaterial`](crate::PendingSplatMaterial)
 //!   into final materials when textures are loaded
 
+use std::borrow::Cow;
+
 use bevy::app::{App, Plugin, Update};
-use bevy::asset::{embedded_asset, Assets, RenderAssetUsages};
+use bevy::log::warn;
+use bevy::asset::{embedded_asset, Assets, Handle, RenderAssetUsages};
 use bevy::ecs::entity::Entity;
 use bevy::ecs::system::{Commands, Query, ResMut};
 use bevy::image::{Image, ImageSampler, ImageSamplerDescriptor, ImageAddressMode, ImageFilterMode};
 use bevy::pbr::{MeshMaterial3d, MaterialPlugin};
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureDataOrder};
+use bevy::render::render_resource::{
+    Extent3d, TextureDataOrder, TextureDescriptor, TextureDimension, TextureFormat, TextureUsages,
+};
 
 use crate::builder::PendingSplatMaterial;
 use crate::material::{PlumeSplatExtension, PlumeSplatMaterial};
@@ -76,23 +81,15 @@ use crate::material::{PlumeSplatExtension, PlumeSplatMaterial};
 /// }
 /// ```
 ///
-/// # Shader Files
+/// # Shader
 ///
-/// The plugin embeds the following shader files:
-///
-/// - `plumesplat.wgsl` - Base shader support
-/// - `plumesplat_ext.wgsl` - Main material extension shader
-/// - `triplanar.wgsl` - Triplanar mapping implementation
-/// - `blending.wgsl` - Material blending utilities
+/// The plugin embeds `shaders/plumesplat_ext.wesl`, the material extension shader.
 pub struct PlumeSplatPlugin;
 
 impl Plugin for PlumeSplatPlugin {
     fn build(&self, app: &mut App) {
-        // Embed the shader files into the binary for self-contained distribution
-        embedded_asset!(app, "shaders/plumesplat.wgsl");
-        embedded_asset!(app, "shaders/plumesplat_ext.wgsl");
-        embedded_asset!(app, "shaders/triplanar.wgsl");
-        embedded_asset!(app, "shaders/blending.wgsl");
+        // Embed the shader into the binary for self-contained distribution
+        embedded_asset!(app, "shaders/plumesplat_ext.wesl");
 
         // Register the extended material type with Bevy's material system
         app.add_plugins(MaterialPlugin::<PlumeSplatMaterial>::default());
@@ -158,87 +155,81 @@ fn process_pending_materials(
 fn combine_textures_into_arrays(
     pending: &PendingSplatMaterial,
     images: &mut Assets<Image>,
-) -> (
-    bevy::asset::Handle<Image>,
-    Option<bevy::asset::Handle<Image>>,
-    Option<bevy::asset::Handle<Image>>,
-) {
-    let num_layers = pending.layer_count() as u32;
-    let has_normals = pending.has_normals();
-    let has_pbr = pending.has_pbr();
-
+) -> (Handle<Image>, Option<Handle<Image>>, Option<Handle<Image>>) {
     // Get dimensions from first albedo texture
     let first_albedo = images.get(&pending.layers[0].albedo).unwrap();
-    let width = first_albedo.texture_descriptor.size.width;
-    let height = first_albedo.texture_descriptor.size.height;
+    let size = (
+        first_albedo.texture_descriptor.size.width,
+        first_albedo.texture_descriptor.size.height,
+    );
 
-    // Create albedo array
+    // Albedo is color data (sRGB). Normal and PBR are raw data and must stay linear.
     let albedo_array = create_texture_array(
-        pending.layers.iter().map(|l| &l.albedo),
-        width,
-        height,
-        num_layers,
+        pending.layers.iter().map(|l| Some(&l.albedo)),
+        size,
+        [255, 255, 255, 255], // unused: every layer has an albedo
+        TextureFormat::Rgba8UnormSrgb,
         images,
     );
 
-    // Create normal array if any layer has normals
-    let normal_array = if has_normals {
-        Some(create_texture_array_with_default(
+    let normal_array = pending.has_normals().then(|| {
+        create_texture_array(
             pending.layers.iter().map(|l| l.normal.as_ref()),
-            width,
-            height,
-            num_layers,
+            size,
+            [128, 128, 255, 255], // flat normal
+            TextureFormat::Rgba8Unorm,
             images,
-            [128, 128, 255, 255], // Default normal pointing up
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
-    // Create PBR array if any layer has PBR
-    let pbr_array = if has_pbr {
-        Some(create_texture_array_with_default(
+    let pbr_array = pending.has_pbr().then(|| {
+        create_texture_array(
             pending.layers.iter().map(|l| l.pbr.as_ref()),
-            width,
-            height,
-            num_layers,
+            size,
+            [0, 128, 255, 128], // metallic=0, roughness=0.5, ao=1.0, height=0.5
+            TextureFormat::Rgba8Unorm,
             images,
-            [0, 128, 255, 128], // Default: metallic=0, roughness=0.5, ao=1.0, height=0.5
-        ))
-    } else {
-        None
-    };
+        )
+    });
 
     (albedo_array, normal_array, pbr_array)
 }
 
-/// Creates a texture array from a sequence of texture handles.
+/// Creates a mipmapped texture array, one layer per handle.
+///
+/// Layers without a texture (`None`) are filled with `default_color`.
 fn create_texture_array<'a>(
-    handles: impl Iterator<Item = &'a bevy::asset::Handle<Image>>,
-    width: u32,
-    height: u32,
-    num_layers: u32,
+    layers: impl Iterator<Item = Option<&'a Handle<Image>>>,
+    (width, height): (u32, u32),
+    default_color: [u8; 4],
+    format: TextureFormat,
     images: &mut Assets<Image>,
-) -> bevy::asset::Handle<Image> {
-    let handles: Vec<_> = handles.collect();
+) -> Handle<Image> {
     let mip_count = calculate_mip_count(width, height);
+    let default_data = default_color.repeat((width * height) as usize);
 
-    // Collect all layer data with mipmaps
     let mut array_data = Vec::new();
-
-    for handle in &handles {
-        let image = images.get(*handle).unwrap();
-        let layer_data = image.data.as_ref().unwrap();
-
-        // Generate mipmaps for this layer
-        let mipmapped = generate_mipmaps(layer_data, width, height, mip_count);
-        array_data.extend(mipmapped);
+    let mut num_layers = 0;
+    for layer in layers {
+        let data = match layer {
+            None => Cow::Borrowed(default_data.as_slice()),
+            Some(handle) => rgba8_bytes(images.get(handle).unwrap(), (width, height))
+                .unwrap_or_else(|| {
+                    warn!(
+                        "plumesplat: layer {num_layers} texture {:?} must be {width}x{height}, \
+                         8- or 16-bit RGBA, with CPU-side data; using a default color instead",
+                        handle.path()
+                    );
+                    Cow::Borrowed(default_data.as_slice())
+                }),
+        };
+        array_data.extend(generate_mipmaps(&data, width, height, mip_count));
+        num_layers += 1;
     }
 
-    // Create the array image
-    let array_image = Image {
+    images.add(Image {
         data: Some(array_data),
-        texture_descriptor: bevy::render::render_resource::TextureDescriptor {
+        texture_descriptor: TextureDescriptor {
             label: Some("splat_texture_array"),
             size: Extent3d {
                 width,
@@ -248,9 +239,8 @@ fn create_texture_array<'a>(
             mip_level_count: mip_count,
             sample_count: 1,
             dimension: TextureDimension::D2,
-            format: bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
-            usage: bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
-                | bevy::render::render_resource::TextureUsages::COPY_DST,
+            format,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
             view_formats: &[],
         },
         sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
@@ -267,79 +257,27 @@ fn create_texture_array<'a>(
         asset_usage: RenderAssetUsages::RENDER_WORLD,
         data_order: TextureDataOrder::LayerMajor,
         copy_on_resize: false,
-    };
-
-    images.add(array_image)
+    })
 }
 
-/// Creates a texture array where missing textures are filled with a default color.
-fn create_texture_array_with_default<'a>(
-    handles: impl Iterator<Item = Option<&'a bevy::asset::Handle<Image>>>,
-    width: u32,
-    height: u32,
-    num_layers: u32,
-    images: &mut Assets<Image>,
-    default_color: [u8; 4],
-) -> bevy::asset::Handle<Image> {
-    let handles: Vec<_> = handles.collect();
-    let mip_count = calculate_mip_count(width, height);
-
-    // Create default texture data
-    let default_data: Vec<u8> = (0..(width * height))
-        .flat_map(|_| default_color)
-        .collect();
-
-    // Collect all layer data with mipmaps
-    let mut array_data = Vec::new();
-
-    for maybe_handle in &handles {
-        let layer_data = if let Some(handle) = maybe_handle {
-            let image = images.get(*handle).unwrap();
-            image.data.as_ref().unwrap().clone()
-        } else {
-            default_data.clone()
-        };
-
-        // Generate mipmaps for this layer
-        let mipmapped = generate_mipmaps(&layer_data, width, height, mip_count);
-        array_data.extend(mipmapped);
+/// Returns the image as RGBA8 bytes. Bevy loads 8-bit PNGs (also grayscale) as
+/// RGBA8 and 16-bit PNGs (common for normal maps) as `Rgba16Unorm`, which is
+/// reduced to its high bytes here. `None` if the size or format is unsupported,
+/// or the image has no CPU-side data.
+fn rgba8_bytes(image: &Image, (width, height): (u32, u32)) -> Option<Cow<'_, [u8]>> {
+    let size = image.texture_descriptor.size;
+    if (size.width, size.height) != (width, height) {
+        return None;
     }
-
-    // Create the array image
-    let array_image = Image {
-        data: Some(array_data),
-        texture_descriptor: bevy::render::render_resource::TextureDescriptor {
-            label: Some("splat_texture_array"),
-            size: Extent3d {
-                width,
-                height,
-                depth_or_array_layers: num_layers,
-            },
-            mip_level_count: mip_count,
-            sample_count: 1,
-            dimension: TextureDimension::D2,
-            format: bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
-            usage: bevy::render::render_resource::TextureUsages::TEXTURE_BINDING
-                | bevy::render::render_resource::TextureUsages::COPY_DST,
-            view_formats: &[],
-        },
-        sampler: ImageSampler::Descriptor(ImageSamplerDescriptor {
-            address_mode_u: ImageAddressMode::Repeat,
-            address_mode_v: ImageAddressMode::Repeat,
-            address_mode_w: ImageAddressMode::ClampToEdge,
-            mag_filter: ImageFilterMode::Linear,
-            min_filter: ImageFilterMode::Linear,
-            mipmap_filter: ImageFilterMode::Linear,
-            anisotropy_clamp: 16,
-            ..Default::default()
-        }),
-        texture_view_descriptor: None,
-        asset_usage: RenderAssetUsages::RENDER_WORLD,
-        data_order: TextureDataOrder::LayerMajor,
-        copy_on_resize: false,
-    };
-
-    images.add(array_image)
+    let data = image.data.as_deref()?;
+    match image.texture_descriptor.format {
+        TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => Some(Cow::Borrowed(data)),
+        // Little-endian u16 per channel: the high byte is the 8-bit value.
+        TextureFormat::Rgba16Unorm => Some(Cow::Owned(
+            data.as_chunks::<2>().0.iter().map(|[_, high]| *high).collect(),
+        )),
+        _ => None,
+    }
 }
 
 /// Calculates the number of mip levels for a texture.
@@ -419,4 +357,40 @@ fn downsample_rgba(
     }
 
     dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(format: TextureFormat, data: Vec<u8>) -> Image {
+        Image::new(
+            Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            TextureDimension::D2,
+            data,
+            format,
+            RenderAssetUsages::default(),
+        )
+    }
+
+    #[test]
+    fn rgba8_is_borrowed_as_is() {
+        let img = image(TextureFormat::Rgba8Unorm, vec![1, 2, 3, 4]);
+        assert_eq!(&*rgba8_bytes(&img, (1, 1)).unwrap(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rgba16_keeps_high_bytes() {
+        // Little-endian u16 channels: 0x80FF, 0x1200, 0xFF01, 0x0000
+        let img = image(TextureFormat::Rgba16Unorm, vec![0xFF, 0x80, 0x00, 0x12, 0x01, 0xFF, 0x00, 0x00]);
+        assert_eq!(&*rgba8_bytes(&img, (1, 1)).unwrap(), &[0x80, 0x12, 0xFF, 0x00]);
+    }
+
+    #[test]
+    fn wrong_size_or_format_is_rejected() {
+        let img = image(TextureFormat::Rgba8Unorm, vec![0; 4]);
+        assert!(rgba8_bytes(&img, (2, 2)).is_none());
+        let img = image(TextureFormat::R8Unorm, vec![0]);
+        assert!(rgba8_bytes(&img, (1, 1)).is_none());
+    }
 }
